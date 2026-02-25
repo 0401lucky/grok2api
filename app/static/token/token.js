@@ -22,6 +22,8 @@ const filterState = {
   statusActive: false,
   statusInvalid: false,
   statusExhausted: false,
+  tagNsfw: false,
+  tagNoNsfw: false,
 };
 
 function normalizeSsoToken(token) {
@@ -45,6 +47,29 @@ function parseQuotaValue(v) {
   const n = Number(v);
   if (!Number.isFinite(n) || n < 0) return { value: -1, known: false };
   return { value: Math.floor(n), known: true };
+}
+
+function parseTagsValue(v) {
+  if (Array.isArray(v)) {
+    const out = [];
+    v.forEach((item) => {
+      if (typeof item !== 'string') return;
+      const s = item.trim();
+      if (s && !out.includes(s)) out.push(s);
+    });
+    return out;
+  }
+  if (typeof v === 'string' && v.trim()) {
+    const text = v.trim();
+    try {
+      const parsed = JSON.parse(text);
+      if (Array.isArray(parsed)) return parseTagsValue(parsed);
+    } catch (e) {
+      // ignore
+    }
+    return [text];
+  }
+  return [];
 }
 
 function extractApiErrorMessage(payload, fallback = '请求失败') {
@@ -89,6 +114,7 @@ function normalizeTokenRecord(pool, raw) {
     note: source.note || '',
     fail_count: source.fail_count || 0,
     use_count: source.use_count || 0,
+    tags: parseTagsValue(source.tags),
     pool: pool,
     _selected: false,
   };
@@ -130,6 +156,8 @@ function refreshFilterStateFromDom() {
   filterState.statusActive = getChecked('filter-status-active');
   filterState.statusInvalid = getChecked('filter-status-invalid');
   filterState.statusExhausted = getChecked('filter-status-exhausted');
+  filterState.tagNsfw = getChecked('filter-tag-nsfw');
+  filterState.tagNoNsfw = getChecked('filter-tag-no-nsfw');
 }
 
 function applyFilters() {
@@ -137,6 +165,7 @@ function applyFilters() {
 
   const hasTypeFilter = filterState.typeSso || filterState.typeSuperSso;
   const hasStatusFilter = filterState.statusActive || filterState.statusInvalid || filterState.statusExhausted;
+  const hasTagFilter = filterState.tagNsfw || filterState.tagNoNsfw;
 
   displayTokens = flatTokens.filter((item) => {
     const tokenType = String(item.token_type || poolToType(item.pool));
@@ -145,6 +174,11 @@ function applyFilters() {
       || (filterState.typeSuperSso && tokenType === 'ssoSuper');
 
     if (!matchesType) return false;
+    const hasNsfw = Array.isArray(item.tags) && item.tags.includes('nsfw');
+    const matchesTag = !hasTagFilter
+      || (filterState.tagNsfw && hasNsfw)
+      || (filterState.tagNoNsfw && !hasNsfw);
+    if (!matchesTag) return false;
     if (!hasStatusFilter) return true;
 
     const active = isTokenActive(item);
@@ -167,7 +201,15 @@ function onFilterChange() {
 }
 
 function resetFilters() {
-  ['filter-type-sso', 'filter-type-supersso', 'filter-status-active', 'filter-status-invalid', 'filter-status-exhausted']
+  [
+    'filter-type-sso',
+    'filter-type-supersso',
+    'filter-status-active',
+    'filter-status-invalid',
+    'filter-status-exhausted',
+    'filter-tag-nsfw',
+    'filter-tag-no-nsfw',
+  ]
     .forEach((id) => {
       const el = document.getElementById(id);
       if (el) el.checked = false;
@@ -220,12 +262,12 @@ async function detectWorkersRuntime() {
 async function applyRuntimeUiFlags() {
   // Default hide first; show back for local/docker after detection.
   setAutoRegisterUiEnabled(false);
-  setNsfwRefreshUiEnabled(false);
   isWorkersRuntime = await detectWorkersRuntime();
   if (!isWorkersRuntime) {
     setAutoRegisterUiEnabled(true);
-    setNsfwRefreshUiEnabled(true);
   }
+  // Workers 侧也已支持 NSFW 刷新/开启能力，保持 UI 一致。
+  setNsfwRefreshUiEnabled(true);
 }
 
 if (document.readyState === 'loading') {
@@ -419,8 +461,8 @@ function renderTable() {
   displayTokens.forEach((item) => {
     const tr = document.createElement('tr');
     const tokenKey = getTokenKey(item.token);
-    const tokenEncoded = encodeURIComponent(item.token);
-    const tokenKeyEncoded = encodeURIComponent(tokenKey);
+    const tokenEncoded = encodeURIComponent(item.token).replaceAll("'", '%27');
+    const tokenKeyEncoded = encodeURIComponent(tokenKey).replaceAll("'", '%27');
 
     // Checkbox (Center)
     const tdCheck = document.createElement('td');
@@ -433,12 +475,17 @@ function renderTable() {
     const tokenShort = item.token.length > 24
       ? item.token.substring(0, 8) + '...' + item.token.substring(item.token.length - 16)
       : item.token;
+    const hasNsfw = Array.isArray(item.tags) && item.tags.includes('nsfw');
+    const tagHtml = hasNsfw ? '<span class="badge badge-orange">NSFW</span>' : '';
     tdToken.innerHTML = `
-                <div class="flex items-center gap-2">
-                    <span class="font-mono text-xs text-gray-500" title="${item.token}">${tokenShort}</span>
-                    <button class="text-gray-400 hover:text-black transition-colors" onclick="copyToClipboard(decodeURIComponent('${tokenEncoded}'), this)">
-                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-                    </button>
+                <div class="flex flex-col gap-1">
+                  <div class="flex items-center gap-2">
+                      <span class="font-mono text-xs text-gray-500" title="${escapeHtml(item.token)}">${escapeHtml(tokenShort)}</span>
+                      <button class="text-gray-400 hover:text-black transition-colors" onclick="copyToClipboard(decodeURIComponent('${tokenEncoded}'), this)">
+                          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                      </button>
+                  </div>
+                  ${tagHtml ? `<div class="flex items-center gap-1">${tagHtml}</div>` : ''}
                 </div>
              `;
 
@@ -549,6 +596,121 @@ function batchExport() {
   document.body.removeChild(a);
 }
 
+function clearNsfwFailureDetails() {
+  const wrap = document.getElementById('nsfw-failures');
+  const list = document.getElementById('nsfw-failures-list');
+  if (list) list.innerHTML = '';
+  if (wrap) wrap.classList.add('hidden');
+}
+
+function formatNsfwEnableError(item) {
+  const err = String(item?.error || '').trim();
+  if (err) return err;
+  const httpStatus = item?.http_status;
+  if (httpStatus !== null && httpStatus !== undefined && httpStatus !== '') return `HTTP ${httpStatus}`;
+  const grpcStatus = item?.grpc_status;
+  if (grpcStatus !== null && grpcStatus !== undefined && grpcStatus !== '') {
+    const msg = String(item?.grpc_message || '').trim();
+    return msg ? `gRPC ${grpcStatus}: ${msg}` : `gRPC ${grpcStatus}`;
+  }
+  return 'unknown error';
+}
+
+function renderNsfwFailureDetails(payload) {
+  const wrap = document.getElementById('nsfw-failures');
+  const list = document.getElementById('nsfw-failures-list');
+  if (!wrap || !list) return;
+
+  const results = payload && typeof payload === 'object' ? payload.results : null;
+  if (!results || typeof results !== 'object') {
+    wrap.classList.add('hidden');
+    list.innerHTML = '';
+    return;
+  }
+
+  const failures = [];
+  Object.keys(results).forEach((tokenMasked) => {
+    const item = results[tokenMasked];
+    if (item && typeof item === 'object' && item.success === true) return;
+    failures.push({ tokenMasked, item });
+  });
+
+  list.innerHTML = '';
+  failures.slice(0, 3).forEach((f) => {
+    const li = document.createElement('li');
+    li.textContent = `${f.tokenMasked}: ${formatNsfwEnableError(f.item)}`;
+    list.appendChild(li);
+  });
+
+  if (failures.length > 0) {
+    wrap.classList.remove('hidden');
+  } else {
+    wrap.classList.add('hidden');
+  }
+}
+
+async function batchEnableNsfw() {
+  if (isBatchProcessing) {
+    showToast('当前有任务进行中', 'info');
+    return;
+  }
+
+  const selected = flatTokens.filter((t) => t._selected);
+  if (selected.length === 0) {
+    showToast('未选择 Token', 'error');
+    return;
+  }
+
+  clearNsfwFailureDetails();
+  const ok = await confirmAction(`是否为选中的 ${selected.length} 个 Token 开启 NSFW 模式？`, { okText: '开启 NSFW' });
+  if (!ok) return;
+
+  isBatchProcessing = true;
+  isBatchPaused = false;
+  currentBatchAction = 'nsfw';
+  batchQueue = [];
+  batchTotal = selected.length;
+  batchProcessed = 0;
+
+  updateBatchProgress();
+  setActionButtonsState();
+
+  try {
+    const tokens = selected.map((t) => normalizeSsoToken(t.token));
+    const res = await fetch('/api/v1/admin/tokens/nsfw/enable', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...buildAuthHeaders(apiKey),
+      },
+      body: JSON.stringify({ tokens }),
+    });
+    const payload = await parseJsonSafely(res);
+    if (!res.ok || payload?.status !== 'success') {
+      finishBatchProcess(true, { silent: true });
+      clearNsfwFailureDetails();
+      showToast(extractApiErrorMessage(payload, payload?.detail || `HTTP ${res.status}`), 'error');
+      return;
+    }
+
+    batchProcessed = batchTotal;
+    updateBatchProgress();
+    finishBatchProcess(false, { silent: true });
+
+    const summary = payload?.summary || {};
+    const okCount = Number(summary?.ok || 0);
+    const failCount = Number(summary?.fail || 0);
+    let msg = `NSFW 开启完成：成功 ${okCount}，失败 ${failCount}`;
+    if (payload?.warning) msg += `\n${payload.warning}`;
+    showToast(msg, failCount > 0 || payload?.warning ? 'warning' : 'success');
+    renderNsfwFailureDetails(payload);
+  } catch (e) {
+    finishBatchProcess(true, { silent: true });
+    clearNsfwFailureDetails();
+    showToast(e?.message ? `请求错误: ${e.message}` : '请求错误', 'error');
+  }
+}
+
 
 // Add Modal
 function openAddModal() {
@@ -639,8 +801,10 @@ async function submitManualAdd() {
     heavy_quota: -1,
     heavy_quota_known: false,
     token_type: poolToType(pool),
+    tags: [],
     note: note,
     status: 'active',
+    fail_count: 0,
     use_count: 0,
     _selected: false
   });
@@ -956,8 +1120,10 @@ async function saveEdit() {
       heavy_quota: -1,
       heavy_quota_known: false,
       token_type: poolToType(newPool || 'ssoBasic'),
+      tags: [],
       note: newNote,
       status: 'active', // default
+      fail_count: 0,
       use_count: 0,
       _selected: false
     });
@@ -993,6 +1159,9 @@ async function syncToServer() {
       status: t.status,
       quota: t.quota,
       heavy_quota: t.heavy_quota,
+      tags: Array.isArray(t.tags)
+        ? t.tags.filter((x) => typeof x === 'string' && x.trim()).map((x) => x.trim())
+        : [],
       note: t.note,
       fail_count: t.fail_count,
       use_count: t.use_count || 0
@@ -1063,7 +1232,9 @@ async function submitImport() {
         heavy_quota: -1,
         heavy_quota_known: false,
         token_type: poolToType(pool),
+        tags: [],
         note: '',
+        fail_count: 0,
         use_count: 0,
         _selected: false
       });
@@ -1289,7 +1460,8 @@ function stopBatchRefresh() {
   finishBatchProcess(true);
 }
 
-function finishBatchProcess(aborted = false) {
+function finishBatchProcess(aborted = false, options = {}) {
+  const silent = Boolean(options && options.silent);
   const action = currentBatchAction;
   isBatchProcessing = false;
   isBatchPaused = false;
@@ -1301,11 +1473,21 @@ function finishBatchProcess(aborted = false) {
   updateSelectionState();
   loadData(); // Final data refresh
 
+  if (silent) return;
+
+  const label = action === 'delete'
+    ? '删除'
+    : action === 'refresh'
+      ? '刷新'
+      : action === 'nsfw'
+        ? 'NSFW 开启'
+        : '任务';
+
   if (aborted) {
-    showToast(action === 'delete' ? '已终止删除' : '已终止刷新', 'info');
-  } else {
-    showToast(action === 'delete' ? '删除完成' : '刷新完成', 'success');
+    showToast(`已终止${label}`, 'info');
+    return;
   }
+  showToast(`${label}完成`, 'success');
 }
 
 async function batchUpdate() {
@@ -1321,12 +1503,17 @@ function updateBatchProgress() {
   if (!isBatchProcessing) {
     container.classList.add('hidden');
     if (pauseBtn) pauseBtn.classList.add('hidden');
-    if (stopBtn) stopBtn.classList.add('hidden');
+  if (stopBtn) stopBtn.classList.add('hidden');
     return;
   }
   const pct = batchTotal ? Math.floor((batchProcessed / batchTotal) * 100) : 0;
-  text.textContent = `${pct}%`;
+  text.textContent = currentBatchAction === 'nsfw' && pct === 0 ? '处理中...' : `${pct}%`;
   container.classList.remove('hidden');
+  if (currentBatchAction === 'nsfw') {
+    if (pauseBtn) pauseBtn.classList.add('hidden');
+    if (stopBtn) stopBtn.classList.add('hidden');
+    return;
+  }
   if (pauseBtn) {
     pauseBtn.textContent = isBatchPaused ? '继续' : '暂停';
     pauseBtn.classList.remove('hidden');
@@ -1339,9 +1526,11 @@ function setActionButtonsState() {
   const disabled = isBatchProcessing;
   const exportBtn = document.getElementById('btn-batch-export');
   const updateBtn = document.getElementById('btn-batch-update');
+  const nsfwBtn = document.getElementById('btn-batch-nsfw');
   const deleteBtn = document.getElementById('btn-batch-delete');
   if (exportBtn) exportBtn.disabled = disabled || selectedCount === 0;
   if (updateBtn) updateBtn.disabled = disabled || selectedCount === 0;
+  if (nsfwBtn) nsfwBtn.disabled = disabled || selectedCount === 0;
   if (deleteBtn) deleteBtn.disabled = disabled || selectedCount === 0;
 }
 

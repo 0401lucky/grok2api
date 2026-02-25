@@ -254,6 +254,47 @@ Notes:
 
 <br>
 
+### `POST /v1/images/generations/nsfw`
+> NSFW-only image generation (forces imagine websocket and best-effort token failover within the request).
+
+```bash
+curl http://localhost:8000/v1/images/generations/nsfw \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $GROK2API_API_KEY" \
+  -d '{
+    "model": "grok-imagine-1.0",
+    "prompt": "A nightclub-style portrait poster",
+    "n": 1,
+    "response_format": "url"
+  }'
+```
+
+<details>
+<summary>Supported request parameters</summary>
+
+<br>
+
+| Field | Type | Description | Allowed values |
+| :--- | :--- | :--- | :--- |
+| `model` | string | Image model ID | `grok-imagine-1.0` |
+| `prompt` | string | Prompt | - |
+| `n` | integer | Number of images | `1` - `4` (streaming: `1` or `2` only) |
+| `stream` | boolean | Enable streaming | `true`, `false` |
+| `size` | string | Image size / aspect ratio | Same as `/v1/images/generations` |
+| `concurrency` | integer | Parallel upstream calls | `1` - `3` (non-stream only) |
+| `response_format` | string | Output format | `url`, `base64`, `b64_json` (defaults to `app.image_format`) |
+
+Notes:
+- This endpoint does **not** depend on `grok.image_generation_method`; it always forces `imagine_ws_experimental`.
+- If the primary token fails, it will try other available tokens within the same request (best-effort).
+- Currently implemented in `python-fastapi` (local/docker). The Workers/Pages variant can be added if needed.
+
+<br>
+
+</details>
+
+<br>
+
 ### `GET /v1/images/method`
 > Get the active image-generation backend mode (used by `/chat` and `/admin/chat` to toggle the experimental waterfall UI).
 
@@ -353,6 +394,7 @@ When upgrading from older versions, the service will keep existing local data an
 | | `base_proxy_url` | Base proxy URL | Base service address proxying Grok official site. | `""` |
 | | `asset_proxy_url` | Asset proxy URL | Proxy URL for Grok static assets (images/videos). | `""` |
 | | `cf_clearance` | CF Clearance | Cloudflare clearance cookie for verification. | `""` |
+| | `wreq_emulation_nsfw` | NSFW emulation | Upstream browser emulation (`curl_cffi` `impersonate`) used by the NSFW enable chain. Empty = use caller/default. | `""` |
 | | `max_retry` | Max retries | Max retries on Grok request failure. | `3` |
 | | `retry_status_codes` | Retry status codes | HTTP status codes that trigger retry. | `[401, 429, 403]` |
 | | `image_generation_method` | Image generation method | Image invoke method (`legacy` is stable default; `imagine_ws_experimental` is experimental). | `legacy` |
@@ -362,6 +404,8 @@ When upgrading from older versions, the service will keep existing local data an
 | | `fail_threshold` | Failure threshold | Consecutive failures before a token is disabled. | `5` |
 | | `save_delay_ms` | Save delay | Debounced save delay for token changes (ms). | `500` |
 | | `reload_interval_sec` | Consistency refresh | Token state refresh interval in multi-worker setups (sec). | `30` |
+| | `nsfw_refresh_concurrency` | NSFW refresh concurrency | Default concurrency for account settings refresh (TOS + BirthDate + NSFW). | `10` |
+| | `nsfw_refresh_retries` | NSFW refresh retries | Extra retries after a failure (excluding the first attempt). | `3` |
 | **cache** | `enable_auto_clean` | Auto clean | Enable cache auto clean; cleanup when exceeding limit. | `true` |
 | | `limit_mb` | Cleanup threshold | Cache size threshold (MB) that triggers cleanup. | `1024` |
 | | `keep_base64_cache` | Keep base64 cache | Keep downloaded image/video cache files when returning Base64 (avoid “local cache = 0”). | `true` |

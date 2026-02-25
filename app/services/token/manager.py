@@ -444,6 +444,24 @@ class TokenManager:
             await self._save()
         return True
 
+    async def add_tag(self, token_str: str, tag: str, save: bool = True) -> bool:
+        """为 Token 添加标签（幂等）。"""
+        token, raw_token = self._find_token_info(token_str)
+        if not token:
+            logger.warning(f"Token {raw_token[:10]}...: not found for tag add")
+            return False
+
+        t = str(tag or "").strip()
+        if not t:
+            return True
+
+        if t not in token.tags:
+            token.tags.append(t)
+
+        if save:
+            await self._save()
+        return True
+
     async def commit(self):
         """Persist current in-memory token state."""
         await self._save()

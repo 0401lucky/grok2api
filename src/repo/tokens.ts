@@ -134,6 +134,44 @@ export async function updateTokenTags(db: Env["DB"], token: string, token_type: 
   ]);
 }
 
+export async function addTokenTag(db: Env["DB"], token: string, tag: string): Promise<boolean> {
+  const row = await dbFirst<{ tags: string }>(db, "SELECT tags FROM tokens WHERE token = ?", [token]);
+  if (!row) return false;
+
+  const trimmed = String(tag ?? "").trim();
+  if (!trimmed) return true;
+
+  const tags = parseTags(row.tags);
+  if (tags.includes(trimmed)) return true;
+  tags.push(trimmed);
+  await dbRun(db, "UPDATE tokens SET tags = ? WHERE token = ?", [JSON.stringify(tags), token]);
+  return true;
+}
+
+export async function clearTokenFailureState(db: Env["DB"], token: string): Promise<boolean> {
+  const exists = await dbFirst<{ token: string }>(db, "SELECT token FROM tokens WHERE token = ?", [token]);
+  if (!exists) return false;
+  await dbRun(
+    db,
+    "UPDATE tokens SET failed_count = 0, cooldown_until = NULL, last_failure_time = NULL, last_failure_reason = NULL, status = 'active' WHERE token = ?",
+    [token],
+  );
+  return true;
+}
+
+export async function expireToken(db: Env["DB"], token: string, reason: string): Promise<boolean> {
+  const exists = await dbFirst<{ token: string }>(db, "SELECT token FROM tokens WHERE token = ?", [token]);
+  if (!exists) return false;
+  const now = nowMs();
+  const msg = String(reason ?? "").slice(0, 500);
+  await dbRun(
+    db,
+    "UPDATE tokens SET status = 'expired', failed_count = ?, cooldown_until = NULL, last_failure_time = ?, last_failure_reason = ? WHERE token = ?",
+    [MAX_FAILURES, now, msg, token],
+  );
+  return true;
+}
+
 export async function updateTokenNote(db: Env["DB"], token: string, token_type: TokenType, note: string): Promise<void> {
   await dbRun(db, "UPDATE tokens SET note = ? WHERE token = ? AND token_type = ?", [note.trim(), token, token_type]);
 }
@@ -171,6 +209,40 @@ export async function selectBestToken(db: Env["DB"], model: string): Promise<{ t
   if (isHeavy) return pick("ssoSuper");
 
   return (await pick("sso")) ?? (await pick("ssoSuper"));
+}
+
+export async function listCandidateTokens(
+  db: Env["DB"],
+  model: string,
+  limit: number,
+): Promise<{ token: string; token_type: TokenType }[]> {
+  const now = nowMs();
+  const isHeavy = model === "grok-4-heavy";
+  const field = isHeavy ? "heavy_remaining_queries" : "remaining_queries";
+  const max = Math.max(1, Math.min(500, Math.floor(Number(limit || 0) || 1)));
+
+  const pickMany = async (token_type: TokenType, want: number) => {
+    const rows = await dbAll<{ token: string }>(
+      db,
+      `SELECT token FROM tokens
+       WHERE token_type = ?
+         AND status != 'expired'
+         AND failed_count < ?
+         AND (cooldown_until IS NULL OR cooldown_until <= ?)
+         AND ${field} != 0
+       ORDER BY CASE WHEN ${field} = -1 THEN 0 ELSE 1 END, ${field} DESC, created_time ASC
+       LIMIT ?`,
+      [token_type, MAX_FAILURES, now, want],
+    );
+    return rows.map((r) => ({ token: r.token, token_type }));
+  };
+
+  if (isHeavy) return pickMany("ssoSuper", max);
+
+  const first = await pickMany("sso", max);
+  if (first.length >= max) return first;
+  const second = await pickMany("ssoSuper", max - first.length);
+  return [...first, ...second];
 }
 
 export async function recordTokenFailure(

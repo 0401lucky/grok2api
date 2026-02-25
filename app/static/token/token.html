@@ -125,6 +125,17 @@
             <span>额度用尽</span>
           </label>
         </div>
+        <div class="filter-group flex items-center gap-3">
+          <span class="text-xs text-[var(--accents-5)]">标签</span>
+          <label class="filter-chip">
+            <input type="checkbox" id="filter-tag-nsfw" onchange="onFilterChange()">
+            <span>NSFW</span>
+          </label>
+          <label class="filter-chip">
+            <input type="checkbox" id="filter-tag-no-nsfw" onchange="onFilterChange()">
+            <span>无 NSFW</span>
+          </label>
+        </div>
         <div class="filter-summary ml-auto flex items-center gap-3">
           <span class="text-xs text-[var(--accents-5)]">结果 <span id="filter-result-count">0</span></span>
           <button onclick="resetFilters()" class="geist-button-outline text-xs px-3 h-7">清空筛选</button>
@@ -155,6 +166,11 @@
         </div>
       </div>
 
+      <div id="nsfw-failures" class="nsfw-failures hidden" aria-live="polite">
+        <div class="nsfw-failures-title">最近 NSFW 失败详情（最多显示 3 条）</div>
+        <ul id="nsfw-failures-list" class="nsfw-failures-list"></ul>
+      </div>
+
       <!-- Batch Actions Bar (Floating Bottom) -->
 
     </div>
@@ -178,6 +194,10 @@
       <button id="btn-batch-update" onclick="batchUpdate()"
         class="geist-button-outline text-xs px-3 gap-1 border-0 hover:bg-gray-100 justify-center">
         刷新
+      </button>
+      <button id="btn-batch-nsfw" onclick="batchEnableNsfw()"
+        class="geist-button-outline text-xs px-3 gap-1 border-0 hover:bg-gray-100 justify-center" disabled>
+        NSFW
       </button>
       <button id="btn-batch-delete" onclick="batchDelete()" class="geist-button-danger text-xs px-3">
         删除
@@ -362,7 +382,7 @@
   <script src="/static/common/header.js?v=4"></script>
   <script src="/static/common/footer.js?v=1"></script>
   <script src="/static/common/toast.js"></script>
-  <script src="/static/token/token.js?v=15"></script>
+  <script src="/static/token/token.js?v=16"></script>
 </body>
 
 </html>

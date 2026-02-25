@@ -17,7 +17,7 @@ import {
   sendExperimentalImageEditRequest,
 } from "../grok/imagineExperimental";
 import { addRequestLog } from "../repo/logs";
-import { applyCooldown, recordTokenFailure, selectBestToken } from "../repo/tokens";
+import { applyCooldown, listCandidateTokens, recordTokenFailure, selectBestToken } from "../repo/tokens";
 import type { ApiAuthInfo } from "../auth";
 import { getApiKeyLimits } from "../repo/apiKeys";
 import { localDayString, tryConsumeDailyUsage, tryConsumeDailyUsageMulti } from "../repo/apiKeyUsage";
@@ -1631,6 +1631,207 @@ openAiRoutes.post("/images/generations", async (c) => {
       start,
       keyName,
       status: 200,
+      error: "",
+    });
+
+    return c.json(buildImageJsonPayload(responseField, selected));
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    if (isContentModerationMessage(message)) {
+      await recordImageLog({
+        env: c.env,
+        ip,
+        model: requestedModel || "image",
+        start,
+        keyName,
+        status: 400,
+        error: message,
+      });
+      return c.json(openAiError(message, "content_policy_violation"), 400);
+    }
+    await recordImageLog({
+      env: c.env,
+      ip,
+      model: requestedModel || "image",
+      start,
+      keyName,
+      status: 500,
+      error: message,
+    });
+    return c.json(openAiError(message || "Internal error", "internal_error"), 500);
+  }
+});
+
+openAiRoutes.post("/images/generations/nsfw", async (c) => {
+  const start = Date.now();
+  const ip = getClientIp(c.req.raw);
+  const keyName = c.get("apiAuth").name ?? "Unknown";
+  const origin = new URL(c.req.url).origin;
+
+  let requestedModel = IMAGE_GENERATION_MODEL_ID;
+  try {
+    const body = (await c.req.json()) as {
+      prompt?: unknown;
+      model?: unknown;
+      n?: unknown;
+      size?: unknown;
+      concurrency?: unknown;
+      stream?: unknown;
+      response_format?: unknown;
+    };
+    const prompt = parseImagePrompt(body.prompt);
+    const promptErr = nonEmptyPromptOrError(prompt);
+    if (promptErr) return c.json(openAiError(promptErr.message, promptErr.code), 400);
+
+    requestedModel = parseImageModel(body.model, IMAGE_GENERATION_MODEL_ID);
+    const modelErr = invalidGenerationModelOrError(requestedModel);
+    if (modelErr) return c.json(openAiError(modelErr.message, modelErr.code), 400);
+
+    const n = parseImageCount(body.n);
+    if (n < 1 || n > 4) return c.json(openAiError("n must be between 1 and 4", "invalid_n"), 400);
+
+    const size = parseImageSize(body.size);
+    const aspectRatio = resolveAspectRatio(size);
+    const concurrencyParsed = parseImageConcurrencyOrError(body.concurrency);
+    if ("error" in concurrencyParsed) {
+      return c.json(
+        openAiError(concurrencyParsed.error.message, concurrencyParsed.error.code),
+        400,
+      );
+    }
+    const concurrency = concurrencyParsed.value;
+    const stream = parseImageStream(body.stream);
+    if (stream && ![1, 2].includes(n)) {
+      return c.json(openAiError(invalidStreamNMessage(), "invalid_stream_n"), 400);
+    }
+
+    const settingsBundle = await getSettings(c.env);
+    const parsedResponseFormat = resolveImageResponseFormatByMethodOrError(
+      body.response_format,
+      imageFormatDefault(settingsBundle),
+      IMAGE_METHOD_IMAGINE_WS_EXPERIMENTAL,
+    );
+    if ("error" in parsedResponseFormat) {
+      return c.json(
+        openAiError(parsedResponseFormat.error.message, parsedResponseFormat.error.code),
+        400,
+      );
+    }
+    const responseFormat = parsedResponseFormat.value;
+    const responseField = responseFieldName(responseFormat);
+    const baseUrl = baseUrlFromSettings(settingsBundle, origin);
+    const cf = normalizeCfCookie(settingsBundle.grok.cf_clearance ?? "");
+
+    const quota = await enforceQuota({
+      env: c.env,
+      apiAuth: c.get("apiAuth"),
+      model: requestedModel,
+      kind: "image",
+      imageCount: n,
+    });
+    if (!quota.ok) return quota.resp;
+
+    const candidates = await listCandidateTokens(c.env.DB, requestedModel, 10);
+    if (!candidates.length) {
+      await recordImageLog({
+        env: c.env,
+        ip,
+        model: requestedModel,
+        start,
+        keyName,
+        status: 503,
+        error: "NO_AVAILABLE_TOKEN",
+      });
+
+      if (stream) {
+        return new Response(
+          createStreamErrorImageEventStream({
+            message: "No available token",
+            responseField,
+          }),
+          { status: 200, headers: streamHeaders() },
+        );
+      }
+      return c.json(openAiError("No available token", "NO_AVAILABLE_TOKEN"), 503);
+    }
+
+    const tryGenerate = async () => {
+      let lastErr = "upstream_error";
+      for (const cand of candidates) {
+        const cookie = buildCookie(cand.token, cf);
+        try {
+          const urls = await collectExperimentalGenerationImages({
+            prompt: imageCallPrompt("generation", prompt),
+            n,
+            cookie,
+            settings: settingsBundle.grok,
+            responseFormat,
+            baseUrl,
+            aspectRatio,
+            concurrency,
+          });
+          const selected = pickImageResults(urls, n);
+          return { selected, token: cand.token };
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          lastErr = msg || lastErr;
+          await recordTokenFailure(c.env.DB, cand.token, 500, msg.slice(0, 200));
+          await applyCooldown(c.env.DB, cand.token, 500);
+        }
+      }
+      throw new Error(lastErr);
+    };
+
+    if (stream) {
+      try {
+        const { selected, token } = await tryGenerate();
+        const streamBody = createSyntheticImageEventStream({
+          selected,
+          responseField,
+          onFinish: async ({ status, duration }) => {
+            await addRequestLog(c.env.DB, {
+              ip,
+              model: requestedModel,
+              duration: Number(duration.toFixed(2)),
+              status,
+              key_name: keyName,
+              token_suffix: getTokenSuffix(token),
+              error: status === 200 ? "" : "stream_error",
+            });
+          },
+        });
+        return new Response(streamBody, { status: 200, headers: streamHeaders() });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        const streamBody = createStreamErrorImageEventStream({
+          message: isContentModerationMessage(msg) ? msg.slice(0, 500) : msg.slice(0, 200),
+          responseField,
+          onFinish: async ({ status, duration }) => {
+            await addRequestLog(c.env.DB, {
+              ip,
+              model: requestedModel,
+              duration: Number(duration.toFixed(2)),
+              status,
+              key_name: keyName,
+              token_suffix: "",
+              error: msg.slice(0, 200),
+            });
+          },
+        });
+        return new Response(streamBody, { status: 200, headers: streamHeaders() });
+      }
+    }
+
+    const { selected, token } = await tryGenerate();
+
+    await recordImageLog({
+      env: c.env,
+      ip,
+      model: requestedModel,
+      start,
+      keyName,
+      status: 200,
+      tokenSuffix: getTokenSuffix(token),
       error: "",
     });
 

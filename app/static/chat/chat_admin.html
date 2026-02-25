@@ -90,6 +90,10 @@
             <label class="field-label">数量 n</label>
             <input id="image-n" type="number" class="geist-input" min="1" max="10" value="1" />
           </div>
+          <div id="image-nsfw-wrap" class="col-span-6 md:col-span-1 flex items-center gap-2">
+            <input id="image-nsfw-toggle" type="checkbox" class="checkbox">
+            <label for="image-nsfw-toggle" class="text-sm select-none">NSFW</label>
+          </div>
           <div id="image-aspect-wrap" class="col-span-6 md:col-span-2 hidden">
             <label class="field-label">宽高比</label>
             <select id="image-aspect" class="geist-input h-[34px]">
@@ -108,7 +112,7 @@
               <option value="3">3</option>
             </select>
           </div>
-          <div id="image-generate-wrap" class="col-span-12 md:col-span-2 flex justify-end">
+          <div id="image-generate-wrap" class="col-span-12 md:col-span-1 flex justify-end">
             <button id="image-generate-btn" class="geist-button text-xs px-4" onclick="generateImage()">生成</button>
           </div>
         </div>
@@ -195,7 +199,7 @@
   <script src="/static/common/admin-auth.js"></script>
   <script src="/static/common/header.js?v=4"></script>
   <script src="/static/common/footer.js"></script>
-  <script src="/static/chat/chat.js?v=5"></script>
+  <script src="/static/chat/chat.js?v=6"></script>
 </body>
 
 </html>

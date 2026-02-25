@@ -1117,8 +1117,9 @@ function buildImageRequestConfig() {
   return { size: ratio, concurrency };
 }
 
-async function streamImage(body, headers) {
-  const res = await fetch('/v1/images/generations', {
+async function streamImage(endpoint, body, headers) {
+  const url = endpoint || '/v1/images/generations';
+  const res = await fetch(url, {
     method: 'POST',
     headers,
     body: JSON.stringify({ ...body, stream: true }),
@@ -1205,7 +1206,17 @@ async function generateImage() {
   stopImageContinuous();
 
   const model = String(q('model-select').value || 'grok-imagine-1.0').trim();
-  const n = Math.max(1, Math.min(10, Math.floor(Number(q('image-n').value || 1) || 1)));
+  const nsfw = Boolean(q('image-nsfw-toggle')?.checked);
+  const endpoint = nsfw ? '/v1/images/generations/nsfw' : '/v1/images/generations';
+  const maxN = nsfw ? 4 : 10;
+  const n = Math.max(1, Math.min(maxN, Math.floor(Number(q('image-n').value || 1) || 1)));
+  if (nsfw) {
+    const inputEl = q('image-n');
+    if (inputEl && Number(inputEl.value || 0) !== n) {
+      inputEl.value = String(n);
+      showToast('NSFW 模式下 n 最大为 4，已自动调整。', 'info');
+    }
+  }
   const stream = Boolean(q('stream-toggle').checked);
   const useStream = stream && n <= 2;
   const { size, concurrency } = buildImageRequestConfig();
@@ -1220,12 +1231,12 @@ async function generateImage() {
     }
 
     if (useStream) {
-      const rendered = await streamImage(reqBody, headers);
+      const rendered = await streamImage(endpoint, reqBody, headers);
       if (!rendered) throw new Error('No image generated');
       return;
     }
 
-    const res = await fetch('/v1/images/generations', {
+    const res = await fetch(endpoint, {
       method: 'POST',
       headers,
       body: JSON.stringify({ ...reqBody, stream: false }),

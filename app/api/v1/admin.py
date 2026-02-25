@@ -19,8 +19,10 @@ from app.core.logger import logger
 from app.services.register import get_auto_register_manager
 from app.services.register.account_settings_refresh import (
     refresh_account_settings_for_tokens,
+    parse_sso_pair,
     normalize_sso_token as normalize_refresh_token,
 )
+from app.services.register.services import NsfwSettingsService
 from app.services.api_keys import api_key_manager
 from app.services.grok.model import ModelService
 from app.services.grok.imagine_generation import (
@@ -434,6 +436,7 @@ def _normalize_admin_token_item(pool_name: str, item: Any) -> dict | None:
             "note": "",
             "fail_count": 0,
             "use_count": 0,
+            "tags": [],
         }
 
     if not isinstance(item, dict):
@@ -448,6 +451,31 @@ def _normalize_admin_token_item(pool_name: str, item: Any) -> dict | None:
     quota, quota_known = _parse_quota_value(item.get("quota"))
     heavy_quota, heavy_quota_known = _parse_quota_value(item.get("heavy_quota"))
 
+    tags_out: list[str] = []
+    tags_raw = item.get("tags")
+    if isinstance(tags_raw, list):
+        for raw in tags_raw:
+            if not isinstance(raw, str):
+                continue
+            s = raw.strip()
+            if s and s not in tags_out:
+                tags_out.append(s)
+    elif isinstance(tags_raw, str) and tags_raw.strip():
+        # Compatibility: sometimes stored as JSON string.
+        try:
+            parsed = json.loads(tags_raw)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, list):
+            for raw in parsed:
+                if not isinstance(raw, str):
+                    continue
+                s = raw.strip()
+                if s and s not in tags_out:
+                    tags_out.append(s)
+        else:
+            tags_out = [tags_raw.strip()]
+
     return {
         "token": token,
         "status": _normalize_token_status(item.get("status")),
@@ -459,6 +487,7 @@ def _normalize_admin_token_item(pool_name: str, item: Any) -> dict | None:
         "note": str(item.get("note") or ""),
         "fail_count": _safe_int(item.get("fail_count") or 0, 0),
         "use_count": _safe_int(item.get("use_count") or 0, 0),
+        "tags": tags_out,
     }
 
 
@@ -767,6 +796,145 @@ async def refresh_tokens_api(data: dict):
         return {"status": "success", "results": results}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/api/v1/admin/tokens/nsfw/enable", dependencies=[Depends(verify_api_key)])
+async def enable_tokens_nsfw_api(data: dict):
+    """批量开启 NSFW（仅开启开关并打 tag，不做协议/生日/失效处理）。"""
+    payload = data if isinstance(data, dict) else {}
+    mgr = await get_token_manager()
+
+    candidates: list[str] = []
+    single = payload.get("token")
+    if isinstance(single, str) and single.strip():
+        candidates.append(single.strip())
+    batch = payload.get("tokens")
+    if isinstance(batch, list):
+        candidates.extend([str(x).strip() for x in batch if isinstance(x, str) and str(x).strip()])
+
+    if bool(payload.get("all")) or not candidates:
+        candidates = []
+        for pool in mgr.pools.values():
+            for info in pool.list():
+                raw = str(getattr(info, "token", "") or "").strip()
+                if raw:
+                    candidates.append(raw)
+
+    pairs: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for raw in candidates:
+        sso, sso_rw = parse_sso_pair(str(raw or "").strip())
+        sso = str(sso or "").strip()
+        if not sso or sso in seen:
+            continue
+        seen.add(sso)
+        pairs.append((sso, str(sso_rw or "").strip() or sso))
+
+    if not pairs:
+        raise HTTPException(status_code=400, detail="No tokens provided")
+
+    def _coerce_positive_int(v: Any, default: int) -> int:
+        try:
+            n = int(v)
+        except Exception:
+            n = int(default)
+        return max(1, n)
+
+    max_tokens = _coerce_positive_int(get_config("performance.nsfw_max_tokens", 1000), 1000)
+    original_count = len(pairs)
+    truncated = original_count > max_tokens
+    if truncated:
+        pairs = pairs[:max_tokens]
+
+    max_concurrent = _coerce_positive_int(get_config("performance.nsfw_max_concurrent", 10), 10)
+    batch_size = _coerce_positive_int(get_config("performance.nsfw_batch_size", 50), 50)
+
+    cf_clearance = str(get_config("grok.cf_clearance", "") or "").strip()
+    service = NsfwSettingsService(cf_clearance=cf_clearance)
+    sem = asyncio.Semaphore(max_concurrent)
+
+    async def _run_one(sso: str, sso_rw: str) -> dict[str, Any]:
+        async with sem:
+            try:
+                res = await asyncio.to_thread(
+                    service.enable_nsfw,
+                    sso,
+                    sso_rw,
+                    "",
+                    None,
+                    None,
+                    15,
+                )
+            except Exception as exc:
+                return {
+                    "success": False,
+                    "http_status": None,
+                    "grpc_status": None,
+                    "grpc_message": None,
+                    "error": str(exc),
+                }
+
+            ok = bool(res.get("ok"))
+            if ok:
+                try:
+                    await mgr.add_tag(sso, "nsfw", save=False)
+                except Exception:
+                    pass
+            return {
+                "success": ok,
+                "http_status": res.get("status_code"),
+                "grpc_status": res.get("grpc_status"),
+                "grpc_message": res.get("grpc_message"),
+                "error": res.get("error"),
+            }
+
+    results_raw: list[tuple[str, dict[str, Any]]] = []
+    for i in range(0, len(pairs), batch_size):
+        chunk = pairs[i:i + batch_size]
+        chunk_results = await asyncio.gather(
+            *[_run_one(sso, sso_rw) for sso, sso_rw in chunk],
+            return_exceptions=True,
+        )
+        for (sso, _), item in zip(chunk, chunk_results):
+            if isinstance(item, Exception):
+                results_raw.append(
+                    (
+                        sso,
+                        {
+                            "success": False,
+                            "http_status": None,
+                            "grpc_status": None,
+                            "grpc_message": None,
+                            "error": str(item),
+                        },
+                    )
+                )
+            else:
+                results_raw.append((sso, item))
+
+    try:
+        await mgr.commit()
+    except Exception:
+        pass
+
+    out: dict[str, Any] = {}
+    ok_count = 0
+    fail_count = 0
+    for token, item in results_raw:
+        masked = f"{token[:8]}...{token[-8:]}" if len(token) > 20 else token
+        if bool(item.get("success")):
+            ok_count += 1
+        else:
+            fail_count += 1
+        out[masked] = item
+
+    response: dict[str, Any] = {
+        "status": "success",
+        "summary": {"total": len(pairs), "ok": ok_count, "fail": fail_count},
+        "results": out,
+    }
+    if truncated:
+        response["warning"] = f"数量超出限制，仅处理前 {max_tokens} 个（共 {original_count} 个）"
+    return response
 
 
 @router.post("/api/v1/admin/tokens/nsfw/refresh", dependencies=[Depends(verify_api_key)])

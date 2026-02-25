@@ -9,6 +9,7 @@ timeout = 120
 base_proxy_url = ""
 asset_proxy_url = ""
 cf_clearance = ""
+wreq_emulation_nsfw = ""
 max_retry = 3
 retry_status_codes = [401,429,403]
 image_generation_method = "legacy"
@@ -41,6 +42,9 @@ media_max_concurrent = 50
 usage_max_concurrent = 25
 assets_delete_batch_size = 10
 admin_assets_batch_size = 10
+nsfw_max_tokens = 1000
+nsfw_max_concurrent = 10
+nsfw_batch_size = 50
 
 [register]
 worker_domain = ""

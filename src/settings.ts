@@ -19,6 +19,7 @@ export interface GrokSettings {
   proxy_pool_interval?: number;
   cache_proxy_url?: string;
   cf_clearance?: string; // stored as VALUE only (no "cf_clearance=" prefix)
+  wreq_emulation_nsfw?: string;
   x_statsig_id?: string;
   dynamic_statsig?: boolean;
   filtered_tags?: string;
@@ -38,6 +39,8 @@ export interface TokenSettings {
   fail_threshold?: number;
   save_delay_ms?: number;
   reload_interval_sec?: number;
+  nsfw_refresh_concurrency?: number;
+  nsfw_refresh_retries?: number;
 }
 
 export interface CacheSettings {
@@ -52,6 +55,9 @@ export interface PerformanceSettings {
   usage_max_concurrent?: number;
   assets_delete_batch_size?: number;
   admin_assets_batch_size?: number;
+  nsfw_max_concurrent?: number;
+  nsfw_batch_size?: number;
+  nsfw_max_tokens?: number;
 }
 
 export interface RegisterSettings {
@@ -96,6 +102,7 @@ const DEFAULTS: SettingsBundle = {
     proxy_pool_interval: 300,
     cache_proxy_url: "",
     cf_clearance: "",
+    wreq_emulation_nsfw: "",
     x_statsig_id: "",
     dynamic_statsig: true,
     filtered_tags: "xaiartifact,xai:tool_usage_card",
@@ -114,6 +121,8 @@ const DEFAULTS: SettingsBundle = {
     fail_threshold: 5,
     save_delay_ms: 500,
     reload_interval_sec: 30,
+    nsfw_refresh_concurrency: 10,
+    nsfw_refresh_retries: 3,
   },
   cache: {
     enable_auto_clean: true,
@@ -126,6 +135,9 @@ const DEFAULTS: SettingsBundle = {
     usage_max_concurrent: 25,
     assets_delete_batch_size: 10,
     admin_assets_batch_size: 10,
+    nsfw_max_concurrent: 10,
+    nsfw_batch_size: 50,
+    nsfw_max_tokens: 1000,
   },
   register: {
     worker_domain: "",

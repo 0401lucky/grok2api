@@ -773,6 +773,157 @@ async def create_image(
     return _build_image_response(selected_images, response_field)
 
 
+@router.post("/images/generations/nsfw")
+async def create_image_nsfw(
+    request: ImageGenerationRequest,
+    api_key: Optional[str] = Depends(verify_api_key),
+):
+    """
+    NSFW 专用图片生成：
+    - 强制使用 imagine websocket（避免 legacy 路径在部分场景下无法稳定出图）
+    - 支持在单次请求内对多个 token 做失败回退（优先使用当前选择的 token）
+    """
+    if request.stream is None:
+        request.stream = False
+
+    validate_generation_request(request)
+    model_id = request.model or "grok-imagine-1.0"
+    n = int(request.n or 1)
+    if n < 1 or n > 4:
+        raise ValidationException(
+            message="n must be between 1 and 4",
+            param="n",
+            code="invalid_n",
+        )
+
+    concurrency = max(1, min(3, int(request.concurrency or 1)))
+    image_method = IMAGE_METHOD_IMAGINE_WS_EXPERIMENTAL
+    response_format = resolve_image_response_format(request.response_format, image_method)
+    request.response_format = response_format
+    response_field = response_field_name(response_format)
+    aspect_ratio = resolve_aspect_ratio(request.size)
+
+    await enforce_daily_quota(api_key, model_id, image_count=n)
+
+    token_mgr, primary = await _get_token_for_model(model_id)
+
+    # 构造候选 token 列表：primary 优先，其余按 pool 顺序追加。
+    candidates: list[str] = []
+    seen: set[str] = set()
+    if primary:
+        candidates.append(primary)
+        seen.add(primary)
+
+    for pool_name in ModelService.pool_candidates_for_model(model_id):
+        pool = token_mgr.pools.get(pool_name)
+        if not pool:
+            continue
+        for info in pool.list():
+            token = str(getattr(info, "token", "") or "").strip()
+            if not token:
+                continue
+            if token.startswith("sso="):
+                token = token[4:]
+            if token in seen:
+                continue
+            # 只尝试本地认为可用的 token，避免反复打到 cooling/expired
+            try:
+                if hasattr(info, "is_available") and not info.is_available():
+                    continue
+            except Exception:
+                pass
+            seen.add(token)
+            candidates.append(token)
+
+    async def _collect_with_failover() -> tuple[str, List[str]]:
+        last_exc: Optional[Exception] = None
+        for token in candidates:
+            try:
+                images = await _collect_experimental_generation_images(
+                    token=token,
+                    prompt=request.prompt,
+                    n=n,
+                    response_format=response_format,
+                    aspect_ratio=aspect_ratio,
+                    concurrency=concurrency,
+                )
+                return token, images
+            except Exception as e:
+                last_exc = e if isinstance(e, Exception) else Exception(str(e))
+                logger.warning(f"NSFW image generation failed for token {token[:10]}...: {e}")
+                continue
+        if last_exc:
+            raise last_exc
+        raise UpstreamException("No available tokens for NSFW image generation")
+
+    if request.stream:
+        stream_state: Dict[str, Any] = {"success": False}
+        used_token = primary
+
+        async def _wrapped_stream():
+            nonlocal used_token
+            try:
+                try:
+                    async for chunk in _experimental_stream_generation(
+                        token=primary,
+                        prompt=request.prompt,
+                        n=n,
+                        response_format=response_format,
+                        response_field=response_field,
+                        aspect_ratio=aspect_ratio,
+                        state=stream_state,
+                    ):
+                        yield chunk
+                    used_token = primary
+                except Exception as stream_err:
+                    logger.warning(
+                        f"NSFW experimental realtime stream failed: {stream_err}. "
+                        "Fallback to synthetic stream."
+                    )
+                    used_token, all_images = await _collect_with_failover()
+                    selected = _pick_images(_dedupe_images(all_images), n)
+                    stream_state["success"] = any(_is_valid_image_value(item) for item in selected)
+                    async for chunk in _synthetic_image_stream(selected, response_field):
+                        yield chunk
+            finally:
+                try:
+                    if stream_state.get("success"):
+                        await token_mgr.sync_usage(
+                            used_token,
+                            model_id,
+                            consume_on_fail=True,
+                            is_usage=True,
+                        )
+                        await _record_request(model_id, True)
+                    else:
+                        await _record_request(model_id, False)
+                except Exception:
+                    pass
+
+        return StreamingResponse(
+            _wrapped_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+
+    used_token, all_images = await _collect_with_failover()
+    selected_images = _pick_images(_dedupe_images(all_images), n)
+    success = any(_is_valid_image_value(img) for img in selected_images)
+    try:
+        if success:
+            await token_mgr.sync_usage(
+                used_token,
+                model_id,
+                consume_on_fail=True,
+                is_usage=True,
+            )
+        await _record_request(model_id, bool(success))
+    except Exception:
+        pass
+
+    return _build_image_response(selected_images, response_field)
+
+
 @router.post("/images/edits")
 async def edit_image(
     prompt: str = Form(...),

@@ -279,6 +279,48 @@ curl http://localhost:8000/v1/images/generations \
 
 <br>
 
+### `POST /v1/images/generations/nsfw`
+
+> NSFW 专用图像生成接口（强制使用 imagine websocket，并在单次请求内对多个 Token 做失败回退）
+
+```bash
+curl http://localhost:8000/v1/images/generations/nsfw \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $GROK2API_API_KEY" \
+  -d '{
+    "model": "grok-imagine-1.0",
+    "prompt": "绘制一张夜店风格的人像海报",
+    "n": 1,
+    "response_format": "url"
+  }'
+```
+
+<details>
+<summary>支持的请求参数</summary>
+
+<br>
+
+| 字段 | 类型 | 说明 | 可用参数 |
+| :--- | :--- | :--- | :--- |
+| `model` | string | 图像模型名 | `grok-imagine-1.0` |
+| `prompt` | string | 图像描述提示词 | - |
+| `n` | integer | 生成数量 | `1` - `4`（流式仅 `1` 或 `2`） |
+| `stream` | boolean | 是否开启流式输出 | `true`, `false` |
+| `size` | string | 图片尺寸/比例 | 同 `/v1/images/generations` |
+| `concurrency` | integer | 新方式并发数 | `1` - `3`（仅非流式生效） |
+| `response_format` | string | 图片返回格式 | `url`, `base64`, `b64_json`（默认跟随 `app.image_format`） |
+
+说明：
+- 该接口 **不依赖** `grok.image_generation_method`，会强制走 `imagine_ws_experimental`。
+- 当当前选择的 Token 出图失败时，会在本次请求内自动切换到其他可用 Token 重试（best-effort）。
+- 当前实现位于 `python-fastapi`（本地/Docker）；Cloudflare Workers/Pages 侧如需同名接口可再补齐。
+
+<br>
+
+</details>
+
+<br>
+
 ### `GET /v1/images/method`
 
 > 返回当前生图后端方式（`/chat` 与 `/admin/chat` 用于判断是否启用“新生图瀑布流 + 宽高比 + 并发”）
@@ -389,6 +431,7 @@ curl http://localhost:8000/v1/images/edits \
 |                       | `base_proxy_url`           | 基础代理 URL | 代理请求到 Grok 官网的基础服务地址。                 | `""`                                                    |
 |                       | `asset_proxy_url`          | 资源代理 URL | 代理请求到 Grok 官网的静态资源（图片/视频）地址。    | `""`                                                    |
 |                       | `cf_clearance`             | CF Clearance | Cloudflare 验证 Cookie，用于验证 Cloudflare 的验证。 | `""`                                                    |
+|                       | `wreq_emulation_nsfw`      | NSFW 指纹模板 | NSFW 开启链路使用的上游浏览器指纹（`curl_cffi` 的 `impersonate` 值）。留空表示使用调用方传入/默认值。 | `""`                                                    |
 |                       | `max_retry`                | 最大重试     | 请求 Grok 服务失败时的最大重试次数。                 | `3`                                                     |
 |                       | `retry_status_codes`       | 重试状态码   | 触发重试的 HTTP 状态码列表。                         | `[401, 429, 403]`                                       |
 |                       | `image_generation_method`  | 生图调用方式 | 生图调用方式（`legacy` 旧方法；`imagine_ws_experimental` 新方法，实验性）。 | `legacy`                                                |
@@ -424,6 +467,8 @@ curl http://localhost:8000/v1/images/edits \
 - 新增配置：
   - `token.nsfw_refresh_concurrency`（默认 `10`）
   - `token.nsfw_refresh_retries`（默认 `3`）
+- 新增：`POST /v1/images/generations/nsfw`（NSFW 专用生图，强制 imagine websocket + Token 失败回退，`n<=4`）
+- 新增配置：`grok.wreq_emulation_nsfw`（可选，用于 NSFW 开启链路的 `impersonate` 指纹模板）
 - 说明：该功能仅在 `python-fastapi`（本地/Docker）开放；`cloudflare-workers` 侧不展示该按钮。
 
 ## Star History

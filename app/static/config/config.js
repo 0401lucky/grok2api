@@ -14,6 +14,9 @@ const NUMERIC_FIELDS = new Set([
   'usage_max_concurrent',
   'assets_delete_batch_size',
   'admin_assets_batch_size',
+  'nsfw_max_tokens',
+  'nsfw_max_concurrent',
+  'nsfw_batch_size',
   'reload_interval_sec',
   'solver_threads',
   'register_threads',
@@ -42,6 +45,7 @@ const LOCALE_MAP = {
     "base_proxy_url": { title: "基础代理 URL", desc: "代理请求到 Grok 官网的基础服务地址。" },
     "asset_proxy_url": { title: "资源代理 URL", desc: "代理请求到 Grok 官网的静态资源（图片/视频）地址。" },
     "cf_clearance": { title: "CF Clearance", desc: "Cloudflare 验证 Cookie，用于验证 Cloudflare 的验证。" },
+    "wreq_emulation_nsfw": { title: "NSFW 指纹模板", desc: "NSFW 开启链路使用的上游浏览器指纹（curl_cffi impersonate 值，例如 chrome120 / chrome116）。留空表示使用默认值。" },
     "max_retry": { title: "最大重试", desc: "请求 Grok 服务失败时的最大重试次数。" },
     "retry_status_codes": { title: "重试状态码", desc: "触发重试的 HTTP 状态码列表。" },
     "image_generation_method": { title: "生图调用方式", desc: "旧方法稳定；新方法为实验性方法。" }
@@ -67,7 +71,10 @@ const LOCALE_MAP = {
     "media_max_concurrent": { title: "媒体并发上限", desc: "视频/媒体生成请求的并发上限。推荐 50。" },
     "usage_max_concurrent": { title: "用量并发上限", desc: "用量查询请求的并发上限。推荐 25。" },
     "assets_delete_batch_size": { title: "资产清理批量", desc: "在线资产删除单批并发数量。推荐 10。" },
-    "admin_assets_batch_size": { title: "管理端批量", desc: "管理端在线资产统计/清理批量并发数量。推荐 10。" }
+    "admin_assets_batch_size": { title: "管理端批量", desc: "管理端在线资产统计/清理批量并发数量。推荐 10。" },
+    "nsfw_max_tokens": { title: "NSFW 最多 Token", desc: "批量开启 NSFW 时最多处理的 Token 数量（超出会截断）。" },
+    "nsfw_max_concurrent": { title: "NSFW 并发上限", desc: "批量开启 NSFW 的最大并发数。推荐 10。" },
+    "nsfw_batch_size": { title: "NSFW 批量大小", desc: "批量开启 NSFW 时单批处理数量。推荐 50。" }
   },
   "register": {
     "label": "自动注册",

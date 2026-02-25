@@ -23,8 +23,11 @@ import { displayKey } from "../utils/crypto";
 import { createAdminSession, deleteAdminSession } from "../repo/adminSessions";
 import {
   addTokens,
+  addTokenTag,
   applyCooldown,
+  clearTokenFailureState,
   deleteTokens,
+  expireToken,
   getAllTags,
   listTokens,
   recordTokenFailure,
@@ -35,6 +38,9 @@ import {
   updateTokenLimits,
 } from "../repo/tokens";
 import { generateImagineWs, resolveAspectRatio } from "../grok/imagineExperimental";
+import { enableNsfw } from "../grok/nsfw";
+import { acceptTos } from "../grok/tos";
+import { setBirthDate } from "../grok/birthDate";
 import { checkRateLimits } from "../grok/rateLimits";
 import { addRequestLog, clearRequestLogs, getRequestLogs, getRequestStats } from "../repo/logs";
 import { getRefreshProgress, setRefreshProgress } from "../repo/refreshProgress";
@@ -74,6 +80,37 @@ function formatBytes(sizeBytes: number): string {
 function normalizeSsoToken(raw: string): string {
   const t = (raw || "").trim();
   return t.startsWith("sso=") ? t.slice(4).trim() : t;
+}
+
+async function runTasksSettledWithLimit<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<PromiseSettledResult<R>[]> {
+  if (!items.length) return [];
+  const results: PromiseSettledResult<R>[] = new Array(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.max(1, Math.min(Math.floor(limit || 1), items.length));
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (true) {
+      const idx = nextIndex++;
+      if (idx >= items.length) break;
+      try {
+        const value = await fn(items[idx] as T);
+        results[idx] = { status: "fulfilled", value };
+      } catch (reason) {
+        results[idx] = { status: "rejected", reason };
+      }
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+function maskToken(token: string): string {
+  const t = String(token ?? "");
+  if (t.length > 20) return `${t.slice(0, 8)}...${t.slice(-8)}`;
+  return t;
 }
 
 async function clearKvCacheByType(
@@ -268,6 +305,7 @@ adminRoutes.get("/api/v1/admin/config", requireAdminAuth, async (c) => {
         base_proxy_url: String(settings.grok.proxy_url ?? ""),
         asset_proxy_url: String(settings.grok.cache_proxy_url ?? ""),
         cf_clearance: String(settings.grok.cf_clearance ?? ""),
+        wreq_emulation_nsfw: String(settings.grok.wreq_emulation_nsfw ?? ""),
         max_retry: 3,
         retry_status_codes: Array.isArray(settings.grok.retry_status_codes) ? settings.grok.retry_status_codes : [401, 429, 403],
         image_generation_method: normalizeImageGenerationMethod(
@@ -280,6 +318,8 @@ adminRoutes.get("/api/v1/admin/config", requireAdminAuth, async (c) => {
         fail_threshold: Number(settings.token.fail_threshold ?? 5),
         save_delay_ms: Number(settings.token.save_delay_ms ?? 500),
         reload_interval_sec: Number(settings.token.reload_interval_sec ?? 30),
+        nsfw_refresh_concurrency: Number(settings.token.nsfw_refresh_concurrency ?? 10),
+        nsfw_refresh_retries: Number(settings.token.nsfw_refresh_retries ?? 3),
       },
       cache: {
         enable_auto_clean: Boolean(settings.cache.enable_auto_clean),
@@ -292,6 +332,9 @@ adminRoutes.get("/api/v1/admin/config", requireAdminAuth, async (c) => {
         usage_max_concurrent: Number(settings.performance.usage_max_concurrent ?? 25),
         assets_delete_batch_size: Number(settings.performance.assets_delete_batch_size ?? 10),
         admin_assets_batch_size: Number(settings.performance.admin_assets_batch_size ?? 10),
+        nsfw_max_concurrent: Number(settings.performance.nsfw_max_concurrent ?? 10),
+        nsfw_batch_size: Number(settings.performance.nsfw_batch_size ?? 50),
+        nsfw_max_tokens: Number(settings.performance.nsfw_max_tokens ?? 1000),
       },
     });
   } catch (e) {
@@ -327,6 +370,7 @@ adminRoutes.post("/api/v1/admin/config", requireAdminAuth, async (c) => {
       if (typeof grokCfg.base_proxy_url === "string") grok_config.proxy_url = grokCfg.base_proxy_url.trim();
       if (typeof grokCfg.asset_proxy_url === "string") grok_config.cache_proxy_url = grokCfg.asset_proxy_url.trim();
       if (typeof grokCfg.cf_clearance === "string") grok_config.cf_clearance = grokCfg.cf_clearance.trim();
+      if (typeof grokCfg.wreq_emulation_nsfw === "string") grok_config.wreq_emulation_nsfw = grokCfg.wreq_emulation_nsfw.trim();
       if (typeof grokCfg.filter_tags === "string") {
         grok_config.filtered_tags = grokCfg.filter_tags;
       } else if (Array.isArray(grokCfg.filter_tags)) {
@@ -356,6 +400,10 @@ adminRoutes.post("/api/v1/admin/config", requireAdminAuth, async (c) => {
         token_config.save_delay_ms = Math.max(0, Math.floor(Number(tokenCfg.save_delay_ms)));
       if (Number.isFinite(Number(tokenCfg.reload_interval_sec)))
         token_config.reload_interval_sec = Math.max(0, Math.floor(Number(tokenCfg.reload_interval_sec)));
+      if (Number.isFinite(Number(tokenCfg.nsfw_refresh_concurrency)))
+        token_config.nsfw_refresh_concurrency = Math.max(1, Math.floor(Number(tokenCfg.nsfw_refresh_concurrency)));
+      if (Number.isFinite(Number(tokenCfg.nsfw_refresh_retries)))
+        token_config.nsfw_refresh_retries = Math.max(0, Math.floor(Number(tokenCfg.nsfw_refresh_retries)));
     }
 
     if (cacheCfg && typeof cacheCfg === "object") {
@@ -371,6 +419,9 @@ adminRoutes.post("/api/v1/admin/config", requireAdminAuth, async (c) => {
         "usage_max_concurrent",
         "assets_delete_batch_size",
         "admin_assets_batch_size",
+        "nsfw_max_concurrent",
+        "nsfw_batch_size",
+        "nsfw_max_tokens",
       ] as const;
       for (const f of fields) {
         if (Number.isFinite(Number(performanceCfg[f]))) performance_config[f] = Math.max(1, Math.floor(Number(performanceCfg[f])));
@@ -612,6 +663,13 @@ adminRoutes.get("/api/v1/admin/tokens", requireAdminAuth, async (c) => {
       const heavyQuotaKnown =
         r.token_type === "ssoSuper" && Number.isFinite(r.heavy_remaining_queries) && r.heavy_remaining_queries >= 0;
       const heavyQuota = heavyQuotaKnown ? r.heavy_remaining_queries : -1;
+      let tags: string[] = [];
+      try {
+        const parsed = JSON.parse(String(r.tags ?? "[]")) as unknown;
+        if (Array.isArray(parsed)) tags = parsed.filter((x): x is string => typeof x === "string");
+      } catch {
+        tags = [];
+      }
       out[pool].push({
         token: `sso=${r.token}`,
         status,
@@ -621,6 +679,7 @@ adminRoutes.get("/api/v1/admin/tokens", requireAdminAuth, async (c) => {
         heavy_quota_known: heavyQuotaKnown,
         token_type: r.token_type,
         note: r.note ?? "",
+        tags,
         fail_count: r.failed_count ?? 0,
         use_count: 0,
       });
@@ -758,6 +817,233 @@ adminRoutes.post("/api/v1/admin/tokens/refresh", requireAdminAuth, async (c) => 
     return c.json(legacyOk({ results }));
   } catch (e) {
     return c.json(legacyErr(`Refresh failed: ${e instanceof Error ? e.message : String(e)}`), 500);
+  }
+});
+
+adminRoutes.post("/api/v1/admin/tokens/nsfw/enable", requireAdminAuth, async (c) => {
+  try {
+    const body = (await c.req.json().catch(() => ({}))) as any;
+    const incoming: string[] = [];
+    if (body && typeof body === "object") {
+      if (typeof body.token === "string") incoming.push(body.token);
+      if (Array.isArray(body.tokens)) incoming.push(...body.tokens.filter((x: any) => typeof x === "string"));
+    }
+
+    let tokens = [...new Set(incoming.map((t) => normalizeSsoToken(t)).filter(Boolean))];
+    if (!tokens.length) {
+      const rows = await listTokens(c.env.DB);
+      tokens = [...new Set(rows.map((r) => r.token).filter(Boolean))];
+    }
+    if (!tokens.length) return c.json(legacyErr("No tokens available"), 400);
+
+    const settings = await getSettings(c.env);
+    const cf = normalizeCfCookie(settings.grok.cf_clearance ?? "");
+
+    const maxTokens = Math.max(1, Math.floor(Number(settings.performance.nsfw_max_tokens ?? 1000)));
+    const originalCount = tokens.length;
+    const truncated = tokens.length > maxTokens;
+    if (truncated) tokens = tokens.slice(0, maxTokens);
+
+    const maxConcurrent = Math.max(
+      1,
+      Math.min(50, Math.floor(Number(settings.performance.nsfw_max_concurrent ?? 10))),
+    );
+    const batchSize = Math.max(
+      1,
+      Math.min(500, Math.floor(Number(settings.performance.nsfw_batch_size ?? 50))),
+    );
+
+    const resultsOut: Record<string, any> = {};
+    let okCount = 0;
+    let failCount = 0;
+
+    for (let i = 0; i < tokens.length; i += batchSize) {
+      const batch = tokens.slice(i, i + batchSize);
+      const settled = await runTasksSettledWithLimit(batch, maxConcurrent, async (token) => {
+        const result = await enableNsfw({ token, cfCookie: cf, timeoutMs: 15_000 });
+        if (result.success) await addTokenTag(c.env.DB, token, "nsfw");
+        return result;
+      });
+
+      for (let j = 0; j < batch.length; j++) {
+        const token = batch[j] as string;
+        const masked = maskToken(token);
+        const item = settled[j];
+        if (!item) continue;
+        if (item.status === "fulfilled") {
+          const v = item.value;
+          if (v.success) okCount += 1;
+          else failCount += 1;
+          resultsOut[masked] = {
+            success: v.success,
+            http_status: v.http_status,
+            grpc_status: v.grpc_status,
+            grpc_message: v.grpc_message,
+            error: v.error,
+          };
+        } else {
+          failCount += 1;
+          resultsOut[masked] = {
+            success: false,
+            error: item.reason instanceof Error ? item.reason.message : String(item.reason),
+          };
+        }
+      }
+    }
+
+    const resp: any = {
+      status: "success",
+      summary: { total: tokens.length, ok: okCount, fail: failCount },
+      results: resultsOut,
+    };
+    if (truncated) {
+      resp.warning = `数量超出限制，仅处理前 ${maxTokens} 个（共 ${originalCount} 个）`;
+    }
+    return c.json(resp);
+  } catch (e) {
+    return c.json(legacyErr(`Enable NSFW failed: ${e instanceof Error ? e.message : String(e)}`), 500);
+  }
+});
+
+adminRoutes.post("/api/v1/admin/tokens/nsfw/refresh", requireAdminAuth, async (c) => {
+  try {
+    const body = (await c.req.json().catch(() => ({}))) as any;
+    const wantAll = Boolean(body && typeof body === "object" && body.all);
+
+    const incoming: string[] = [];
+    if (!wantAll && body && typeof body === "object") {
+      if (typeof body.token === "string") incoming.push(body.token);
+      if (Array.isArray(body.tokens)) incoming.push(...body.tokens.filter((x: any) => typeof x === "string"));
+    }
+
+    let tokens: string[] = [];
+    if (wantAll) {
+      const rows = await listTokens(c.env.DB);
+      tokens = rows.map((r) => r.token).filter(Boolean);
+    } else {
+      tokens = incoming.map((t) => normalizeSsoToken(t)).filter(Boolean);
+    }
+    tokens = [...new Set(tokens)];
+    if (!tokens.length) return c.json(legacyErr("No tokens provided"), 400);
+
+    const settings = await getSettings(c.env);
+    const cf = normalizeCfCookie(settings.grok.cf_clearance ?? "");
+
+    const defaultConcurrency = Number(settings.token.nsfw_refresh_concurrency ?? 10);
+    const defaultRetries = Number(settings.token.nsfw_refresh_retries ?? 3);
+    const concurrencyRaw = body && typeof body === "object" ? body.concurrency : undefined;
+    const retriesRaw = body && typeof body === "object" ? body.retries : undefined;
+
+    const concurrency = Math.max(
+      1,
+      Math.min(
+        50,
+        Math.floor(Number(concurrencyRaw ?? defaultConcurrency) || defaultConcurrency || 10),
+      ),
+    );
+    const retries = Math.max(
+      0,
+      Math.min(10, Math.floor(Number(retriesRaw ?? defaultRetries) || defaultRetries || 3)),
+    );
+    const maxAttempts = retries + 1;
+
+    const refreshOne = async (token: string) => {
+      let lastStep = "unknown";
+      let lastError = "unknown error";
+
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+          const tos = await acceptTos({ token, cfCookie: cf, timeoutMs: 15_000 });
+          if (!tos.ok) {
+            lastStep = "tos";
+            lastError = tos.error || `HTTP ${tos.http_status}`;
+            continue;
+          }
+
+          const birth = await setBirthDate({ token, cfCookie: cf, timeoutMs: 15_000 });
+          if (!birth.ok) {
+            lastStep = "birth";
+            lastError = birth.error || `HTTP ${birth.http_status}`;
+            continue;
+          }
+
+          const nsfw = await enableNsfw({ token, cfCookie: cf, timeoutMs: 15_000 });
+          if (!nsfw.success) {
+            lastStep = "nsfw";
+            lastError = nsfw.error || `HTTP ${nsfw.http_status}`;
+            continue;
+          }
+
+          await addTokenTag(c.env.DB, token, "nsfw");
+          await clearTokenFailureState(c.env.DB, token);
+          return { token, ok: true, attempts: attempt };
+        } catch (e) {
+          lastStep = "exception";
+          lastError = e instanceof Error ? e.message : String(e);
+        }
+      }
+
+      const reason = `account_settings_refresh_failed step=${lastStep} attempts=${maxAttempts} error=${lastError}`;
+      const invalidated = await expireToken(c.env.DB, token, reason);
+      return {
+        token,
+        ok: false,
+        attempts: maxAttempts,
+        step: lastStep,
+        error: lastError,
+        invalidated: Boolean(invalidated),
+      };
+    };
+
+    const settled = await runTasksSettledWithLimit(tokens, concurrency, refreshOne);
+
+    const failed: any[] = [];
+    let success = 0;
+    let fail = 0;
+    let invalidated = 0;
+
+    for (let i = 0; i < settled.length; i++) {
+      const item = settled[i];
+      if (!item) continue;
+      if (item.status === "fulfilled") {
+        const v: any = item.value;
+        if (v && v.ok) {
+          success += 1;
+        } else {
+          fail += 1;
+          if (v && v.invalidated) invalidated += 1;
+          failed.push(v);
+        }
+      } else {
+        fail += 1;
+        const token = tokens[i] as string;
+        const msg = item.reason instanceof Error ? item.reason.message : String(item.reason);
+        const reason = `account_settings_refresh_failed step=exception attempts=${maxAttempts} error=${msg}`;
+        const inv = await expireToken(c.env.DB, token, reason);
+        if (inv) invalidated += 1;
+        failed.push({
+          token,
+          ok: false,
+          attempts: maxAttempts,
+          step: "exception",
+          error: msg,
+          invalidated: Boolean(inv),
+        });
+      }
+    }
+
+    return c.json({
+      status: "success",
+      summary: {
+        total: tokens.length,
+        success,
+        failed: fail,
+        invalidated,
+      },
+      failed,
+    });
+  } catch (e) {
+    return c.json(legacyErr(`NSFW refresh failed: ${e instanceof Error ? e.message : String(e)}`), 500);
   }
 });
 
