@@ -862,8 +862,51 @@ adminRoutes.post("/api/v1/admin/tokens/nsfw/enable", requireAdminAuth, async (c)
     for (let i = 0; i < tokens.length; i += batchSize) {
       const batch = tokens.slice(i, i + batchSize);
       const settled = await runTasksSettledWithLimit(batch, maxConcurrent, async (token) => {
+        const tos = await acceptTos({ token, cfCookie: cf, timeoutMs: 15_000 });
+        if (!tos.ok) {
+          await markTokenAccountSettingsFailure(
+            c.env.DB,
+            token,
+            `nsfw_enable_failed step=tos error=${tos.error ?? `HTTP ${tos.http_status}`}`,
+          );
+          return {
+            success: false,
+            http_status: tos.http_status,
+            grpc_status: tos.grpc_status,
+            grpc_message: tos.grpc_message,
+            error: `tos failed: ${tos.error ?? `HTTP ${tos.http_status}`}`,
+          };
+        }
+
+        const birth = await setBirthDate({ token, cfCookie: cf, timeoutMs: 15_000 });
+        if (!birth.ok) {
+          await markTokenAccountSettingsFailure(
+            c.env.DB,
+            token,
+            `nsfw_enable_failed step=birth error=${birth.error ?? `HTTP ${birth.http_status}`}`,
+          );
+          return {
+            success: false,
+            http_status: birth.http_status,
+            grpc_status: null,
+            grpc_message: null,
+            error: `birth-date failed: ${birth.error ?? `HTTP ${birth.http_status}`}`,
+          };
+        }
+
         const result = await enableNsfw({ token, cfCookie: cf, timeoutMs: 15_000 });
-        if (result.success) await addTokenTag(c.env.DB, token, "nsfw");
+        if (!result.success) {
+          await markTokenAccountSettingsFailure(
+            c.env.DB,
+            token,
+            `nsfw_enable_failed step=nsfw error=${result.error ?? `HTTP ${result.http_status}`}`,
+          );
+          result.error = `nsfw enable failed: ${result.error ?? `HTTP ${result.http_status}`}`;
+          return result;
+        }
+
+        await addTokenTag(c.env.DB, token, "nsfw");
+        await markTokenAccountSettingsSuccess(c.env.DB, token);
         return result;
       });
 

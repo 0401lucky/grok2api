@@ -17,7 +17,13 @@ import {
   sendExperimentalImageEditRequest,
 } from "../grok/imagineExperimental";
 import { addRequestLog } from "../repo/logs";
-import { applyCooldown, listCandidateTokens, recordTokenFailure, selectBestToken } from "../repo/tokens";
+import {
+  applyCooldown,
+  listCandidateTokens,
+  listCandidateTokensWithTag,
+  recordTokenFailure,
+  selectBestToken,
+} from "../repo/tokens";
 import type { ApiAuthInfo } from "../auth";
 import { getApiKeyLimits } from "../repo/apiKeys";
 import { localDayString, tryConsumeDailyUsage, tryConsumeDailyUsageMulti } from "../repo/apiKeyUsage";
@@ -1731,7 +1737,7 @@ openAiRoutes.post("/images/generations/nsfw", async (c) => {
     });
     if (!quota.ok) return quota.resp;
 
-    const candidates = await listCandidateTokens(c.env.DB, requestedModel, 10);
+    const candidates = await listCandidateTokensWithTag(c.env.DB, requestedModel, 10, "nsfw");
     if (!candidates.length) {
       await recordImageLog({
         env: c.env,
@@ -1743,16 +1749,17 @@ openAiRoutes.post("/images/generations/nsfw", async (c) => {
         error: "NO_AVAILABLE_TOKEN",
       });
 
+      const noTokenMessage = "No NSFW-enabled token (tag: nsfw). Enable NSFW in admin first.";
       if (stream) {
         return new Response(
           createStreamErrorImageEventStream({
-            message: "No available token",
+            message: noTokenMessage,
             responseField,
           }),
           { status: 200, headers: streamHeaders() },
         );
       }
-      return c.json(openAiError("No available token", "NO_AVAILABLE_TOKEN"), 503);
+      return c.json(openAiError(noTokenMessage, "NO_AVAILABLE_TOKEN"), 503);
     }
 
     const tryGenerate = async () => {
@@ -1775,8 +1782,16 @@ openAiRoutes.post("/images/generations/nsfw", async (c) => {
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
           lastErr = msg || lastErr;
-          await recordTokenFailure(c.env.DB, cand.token, 500, msg.slice(0, 200));
-          await applyCooldown(c.env.DB, cand.token, 500);
+          if (isContentModerationMessage(msg)) {
+            throw new Error(msg);
+          }
+          const lower = String(msg || "").toLowerCase();
+          const isBlocked =
+            lower.includes("imagine websocket blocked") || (lower.includes("imagine") && lower.includes("blocked"));
+          if (!isBlocked) {
+            await recordTokenFailure(c.env.DB, cand.token, 500, msg.slice(0, 200));
+            await applyCooldown(c.env.DB, cand.token, 500);
+          }
         }
       }
       throw new Error(lastErr);

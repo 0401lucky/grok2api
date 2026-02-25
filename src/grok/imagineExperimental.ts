@@ -122,12 +122,30 @@ function extractUrl(msg: WsJson): string {
   return "";
 }
 
-function isCompleted(msg: WsJson, progress: number | null): boolean {
-  const status = String(msg.current_status ?? msg.currentStatus ?? "")
-    .trim()
-    .toLowerCase();
-  if (status === "completed" || status === "done" || status === "success") return true;
-  return progress !== null && progress >= 100;
+function getUrlPathname(rawUrl: string): string {
+  const value = String(rawUrl ?? "").trim();
+  if (!value) return "";
+  try {
+    return new URL(value).pathname || value;
+  } catch {
+    return value;
+  }
+}
+
+function extractImageIdFromUrl(rawUrl: string): string | null {
+  const path = getUrlPathname(rawUrl);
+  const marker = "/images/";
+  const idx = path.indexOf(marker);
+  if (idx < 0) return null;
+  const tail = path.slice(idx + marker.length);
+  const dot = tail.lastIndexOf(".");
+  if (dot <= 0) return null;
+  const imageId = tail.slice(0, dot);
+  const ext = tail.slice(dot + 1).toLowerCase();
+  if (!["png", "jpg", "jpeg"].includes(ext)) return null;
+  if (!imageId) return null;
+  if (!/^[0-9a-fA-F-]+$/.test(imageId)) return null;
+  return imageId;
 }
 
 function buildImagineWsPayload(prompt: string, requestId: string, aspectRatio: string): WsJson {
@@ -140,7 +158,7 @@ function buildImagineWsPayload(prompt: string, requestId: string, aspectRatio: s
         {
           requestId,
           text: prompt,
-          type: "input_scroll",
+          type: "input_text",
           properties: {
             section_count: 0,
             is_kids_mode: false,
@@ -190,9 +208,23 @@ export async function generateImagineWs(args: {
 
   const imageIndexes = new Map<string, number>();
   const finalUrls = new Map<string, string>();
+  let sawAnyImage = false;
+  let sawMedium = false;
 
   await new Promise<void>((resolve, reject) => {
     let finished = false;
+
+    const extractBlobLength = (msg: WsJson): number | null => {
+      const blob = msg.blob;
+      return typeof blob === "string" ? blob.length : null;
+    };
+
+    const isFinalImage = (url: string, blobLen: number | null): boolean => {
+      if (blobLen === null) return false;
+      if (blobLen <= 0) return false;
+      const path = getUrlPathname(url).toLowerCase();
+      return path.endsWith(".jpg") && blobLen > 100_000;
+    };
 
     const onMessage = (event: MessageEvent) => {
       const msg = parseWsJson(event.data);
@@ -210,8 +242,12 @@ export async function generateImagineWs(args: {
         return;
       }
 
+      const imageUrl = extractUrl(msg);
+      if (!imageUrl) return;
+
       const rawImageId = String(msg.id ?? msg.imageId ?? msg.image_id ?? "");
-      const imageId = rawImageId || `image-${imageIndexes.size}`;
+      const derivedImageId = extractImageIdFromUrl(imageUrl);
+      const imageId = rawImageId || derivedImageId || `image-${imageIndexes.size}`;
       if (!imageIndexes.has(imageId)) imageIndexes.set(imageId, imageIndexes.size);
       const imageIndex = imageIndexes.get(imageId) ?? 0;
 
@@ -222,21 +258,32 @@ export async function generateImagineWs(args: {
         });
       }
 
-      const imageUrl = extractUrl(msg);
-      if (imageUrl && isCompleted(msg, progress)) {
-        if (!finalUrls.has(imageId)) finalUrls.set(imageId, imageUrl);
-        if (args.completedCb) {
-          Promise.resolve(args.completedCb({ index: imageIndex, url: imageUrl })).catch(() => {
-            // ignore callback failures
-          });
-        }
-        if (finalUrls.size >= targetCount) finish();
+      sawAnyImage = true;
+
+      const blobLen = extractBlobLength(msg);
+      if (blobLen !== null && blobLen > 30_000) sawMedium = true;
+
+      if (!isFinalImage(imageUrl, blobLen)) return;
+
+      if (!finalUrls.has(imageId)) finalUrls.set(imageId, imageUrl);
+      if (args.completedCb) {
+        Promise.resolve(args.completedCb({ index: imageIndex, url: imageUrl })).catch(() => {
+          // ignore callback failures
+        });
       }
+      if (finalUrls.size >= targetCount) finish();
     };
 
     const onClose = () => {
-      if (finalUrls.size > 0) finish();
-      else finish(new Error("Imagine websocket closed before completed images"));
+      if (finalUrls.size > 0) {
+        finish();
+        return;
+      }
+      if (sawMedium && sawAnyImage) {
+        finish(new Error("Imagine websocket blocked: no final image"));
+        return;
+      }
+      finish(new Error("Imagine websocket closed before completed images"));
     };
 
     const onError = () => {
@@ -244,6 +291,14 @@ export async function generateImagineWs(args: {
     };
 
     const timer = setTimeout(() => {
+      if (finalUrls.size > 0) {
+        finish();
+        return;
+      }
+      if (sawMedium && sawAnyImage) {
+        finish(new Error(`Imagine websocket blocked (timeout ${timeoutMs}ms): no final image`));
+        return;
+      }
       finish(new Error(`Imagine websocket timeout after ${timeoutMs}ms`));
     }, timeoutMs);
 

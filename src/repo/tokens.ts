@@ -239,6 +239,39 @@ export async function selectBestToken(db: Env["DB"], model: string): Promise<{ t
   return (await pick("sso")) ?? (await pick("ssoSuper"));
 }
 
+export async function selectBestTokenWithTag(
+  db: Env["DB"],
+  model: string,
+  tag: string,
+): Promise<{ token: string; token_type: TokenType } | null> {
+  const now = nowMs();
+  const isHeavy = model === "grok-4-heavy";
+  const field = isHeavy ? "heavy_remaining_queries" : "remaining_queries";
+  const needle = String(tag ?? "").trim();
+  if (!needle) return selectBestToken(db, model);
+  const tagLike = `%\"${needle}\"%`;
+
+  const pick = async (token_type: TokenType): Promise<{ token: string; token_type: TokenType } | null> => {
+    const row = await dbFirst<{ token: string }>(
+      db,
+      `SELECT token FROM tokens
+       WHERE token_type = ?
+         AND status != 'expired'
+         AND failed_count < ?
+         AND (cooldown_until IS NULL OR cooldown_until <= ?)
+         AND ${field} != 0
+         AND tags LIKE ?
+       ORDER BY CASE WHEN ${field} = -1 THEN 0 ELSE 1 END, ${field} DESC, created_time ASC
+       LIMIT 1`,
+      [token_type, MAX_FAILURES, now, tagLike],
+    );
+    return row ? { token: row.token, token_type } : null;
+  };
+
+  if (isHeavy) return pick("ssoSuper");
+  return (await pick("sso")) ?? (await pick("ssoSuper"));
+}
+
 export async function listCandidateTokens(
   db: Env["DB"],
   model: string,
@@ -261,6 +294,45 @@ export async function listCandidateTokens(
        ORDER BY CASE WHEN ${field} = -1 THEN 0 ELSE 1 END, ${field} DESC, created_time ASC
        LIMIT ?`,
       [token_type, MAX_FAILURES, now, want],
+    );
+    return rows.map((r) => ({ token: r.token, token_type }));
+  };
+
+  if (isHeavy) return pickMany("ssoSuper", max);
+
+  const first = await pickMany("sso", max);
+  if (first.length >= max) return first;
+  const second = await pickMany("ssoSuper", max - first.length);
+  return [...first, ...second];
+}
+
+export async function listCandidateTokensWithTag(
+  db: Env["DB"],
+  model: string,
+  limit: number,
+  tag: string,
+): Promise<{ token: string; token_type: TokenType }[]> {
+  const now = nowMs();
+  const isHeavy = model === "grok-4-heavy";
+  const field = isHeavy ? "heavy_remaining_queries" : "remaining_queries";
+  const max = Math.max(1, Math.min(500, Math.floor(Number(limit || 0) || 1)));
+  const needle = String(tag ?? "").trim();
+  if (!needle) return listCandidateTokens(db, model, limit);
+  const tagLike = `%\"${needle}\"%`;
+
+  const pickMany = async (token_type: TokenType, want: number) => {
+    const rows = await dbAll<{ token: string }>(
+      db,
+      `SELECT token FROM tokens
+       WHERE token_type = ?
+         AND status != 'expired'
+         AND failed_count < ?
+         AND (cooldown_until IS NULL OR cooldown_until <= ?)
+         AND ${field} != 0
+         AND tags LIKE ?
+       ORDER BY CASE WHEN ${field} = -1 THEN 0 ELSE 1 END, ${field} DESC, created_time ASC
+       LIMIT ?`,
+      [token_type, MAX_FAILURES, now, tagLike, want],
     );
     return rows.map((r) => ({ token: r.token, token_type }));
   };
