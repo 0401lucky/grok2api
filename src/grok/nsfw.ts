@@ -12,6 +12,11 @@ const FALLBACK_UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36";
 
 const NSFW_PROTO_PAYLOAD_LEGACY = new Uint8Array([0x08, 0x01, 0x10, 0x01]);
+const NSFW_PROTO_PAYLOAD_NAME_BASED = (() => {
+  // 历史版本里常见的一种 payload：通过 feature name 字符串开启 always_show_nsfw_content。
+  const name = new TextEncoder().encode("always_show_nsfw_content");
+  return new Uint8Array([0x0a, 0x02, 0x10, 0x01, 0x12, 0x1a, 0x0a, 0x18, ...Array.from(name)]);
+})();
 
 export interface NsfwResult {
   success: boolean;
@@ -207,19 +212,19 @@ async function enableChain(args: {
   userAgent: string;
   timeoutMs: number;
 }): Promise<NsfwResult> {
-  const enableGrpcChain = async (): Promise<NsfwResult> => {
+  const enableGrpcChain = async (): Promise<{ primary: NsfwResult; nameBased: NsfwResult }> => {
     let result = await sendEnableRequest({
       ...args,
       protoPayload: buildProtoPayload(2, NSFW_FEATURES_PATH),
     });
-    if (result.success) return result;
+    if (result.success) return { primary: result, nameBased: result };
 
     if (shouldRetryWithAlternateMaskField(result)) {
       const second = await sendEnableRequest({
         ...args,
         protoPayload: buildProtoPayload(3, NSFW_FEATURES_PATH),
       });
-      if (second.success) return second;
+      if (second.success) return { primary: second, nameBased: second };
       second.error = `primary payload failed: ${result.error ?? "unknown"}; alternate mask field failed: ${second.error ?? "unknown"}`;
       result = second;
     }
@@ -229,7 +234,7 @@ async function enableChain(args: {
         ...args,
         protoPayload: buildProtoPayload(2, NSFW_FEATURES_ENABLED_PATH),
       });
-      if (third.success) return third;
+      if (third.success) return { primary: third, nameBased: third };
       third.error = `previous payload failed: ${result.error ?? "unknown"}; alternate mask path failed: ${third.error ?? "unknown"}`;
       result = third;
     }
@@ -239,28 +244,36 @@ async function enableChain(args: {
         ...args,
         protoPayload: NSFW_PROTO_PAYLOAD_LEGACY,
       });
-      if (legacy.success) return legacy;
+      if (legacy.success) return { primary: legacy, nameBased: legacy };
       legacy.error = `previous payload failed: ${result.error ?? "unknown"}; legacy payload failed: ${legacy.error ?? "unknown"}`;
       result = legacy;
     }
 
-    return result;
+    const nameBased = await sendEnableRequest({
+      ...args,
+      protoPayload: NSFW_PROTO_PAYLOAD_NAME_BASED,
+    });
+    if (nameBased.success) return { primary: result, nameBased };
+    nameBased.error = `previous payload failed: ${result.error ?? "unknown"}; name-based payload failed: ${nameBased.error ?? "unknown"}`;
+    return { primary: result, nameBased };
   };
 
-  let result = await enableGrpcChain();
+  const first = await enableGrpcChain();
+  const result = first.nameBased;
   if (result.success) return result;
 
-  if (shouldRetryWithAgeVerify(result)) {
+  if (shouldRetryWithAgeVerify(first.primary) || shouldRetryWithAgeVerify(first.nameBased)) {
     const age = await verifyAgeViaRest(args);
     if (!age.success) {
-      age.error = `gRPC update failed: ${result.error ?? "unknown"}; age-verify fallback failed: ${age.error ?? "unknown"}`;
+      const failedMsg = first.nameBased.error ?? first.primary.error ?? "unknown";
+      age.error = `gRPC update failed: ${failedMsg}; age-verify fallback failed: ${age.error ?? "unknown"}`;
       return age;
     }
 
     const afterAge = await enableGrpcChain();
-    if (afterAge.success) return afterAge;
-    afterAge.error = `age-verify ok; enable retry failed: ${afterAge.error ?? "unknown"}`;
-    return afterAge;
+    if (afterAge.nameBased.success) return afterAge.nameBased;
+    afterAge.nameBased.error = `age-verify ok; enable retry failed: ${afterAge.nameBased.error ?? "unknown"}`;
+    return afterAge.nameBased;
   }
 
   return result;
