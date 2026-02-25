@@ -180,6 +180,7 @@ export async function generateImagineWs(args: {
   settings: GrokSettings;
   timeoutMs?: number;
   aspectRatio?: string;
+  preferDataUrl?: boolean;
   progressCb?: (progress: ImagineWsProgress) => void | Promise<void>;
   completedCb?: (completed: ImagineWsCompleted) => void | Promise<void>;
 }): Promise<string[]> {
@@ -217,6 +218,27 @@ export async function generateImagineWs(args: {
     const extractBlobLength = (msg: WsJson): number | null => {
       const blob = msg.blob;
       return typeof blob === "string" ? blob.length : null;
+    };
+
+    const extractBlob = (msg: WsJson): string => {
+      const blob = msg.blob;
+      return typeof blob === "string" ? blob.trim() : "";
+    };
+
+    const blobToDataUrl = (blob: string, imageUrl: string): string => {
+      if (!blob) return "";
+      if (blob.startsWith("data:image/")) return blob;
+      const m = blob.match(/^data:[^,]+,(.+)$/i);
+      const b64 = (m?.[1] ?? blob).replace(/\s+/g, "");
+      if (!b64) return "";
+
+      const path = getUrlPathname(imageUrl).toLowerCase();
+      const mime = path.endsWith(".png")
+        ? "image/png"
+        : path.endsWith(".webp")
+          ? "image/webp"
+          : "image/jpeg";
+      return `data:${mime};base64,${b64}`;
     };
 
     const isFinalImage = (url: string, blobLen: number | null): boolean => {
@@ -261,13 +283,16 @@ export async function generateImagineWs(args: {
       sawAnyImage = true;
 
       const blobLen = extractBlobLength(msg);
+      const blob = extractBlob(msg);
       if (blobLen !== null && blobLen > 30_000) sawMedium = true;
 
       if (!isFinalImage(imageUrl, blobLen)) return;
 
-      if (!finalUrls.has(imageId)) finalUrls.set(imageId, imageUrl);
+      const finalValue =
+        args.preferDataUrl && blob ? blobToDataUrl(blob, imageUrl) || imageUrl : imageUrl;
+      if (!finalUrls.has(imageId)) finalUrls.set(imageId, finalValue);
       if (args.completedCb) {
-        Promise.resolve(args.completedCb({ index: imageIndex, url: imageUrl })).catch(() => {
+        Promise.resolve(args.completedCb({ index: imageIndex, url: finalValue })).catch(() => {
           // ignore callback failures
         });
       }

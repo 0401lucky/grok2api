@@ -330,10 +330,23 @@ async function convertRawUrlByFormat(
     settings: Awaited<ReturnType<typeof getSettings>>["grok"];
   },
 ): Promise<string> {
-  if (responseFormat === "url") {
-    return toProxyUrl(args.baseUrl, encodeAssetPath(rawUrl));
+  const value = String(rawUrl ?? "").trim();
+  if (!value) return "";
+
+  if (responseFormat !== "url" && value.startsWith("data:image/")) {
+    const comma = value.indexOf(",");
+    if (comma >= 0) return value.slice(comma + 1).trim();
+    return "";
   }
-  return fetchImageAsBase64({ rawUrl, cookie: args.cookie, settings: args.settings });
+
+  if (responseFormat === "url" && value.startsWith("data:image/")) {
+    return value;
+  }
+
+  if (responseFormat === "url") {
+    return toProxyUrl(args.baseUrl, encodeAssetPath(value));
+  }
+  return fetchImageAsBase64({ rawUrl: value, cookie: args.cookie, settings: args.settings });
 }
 
 async function convertRawUrlsByFormatBestEffort(args: {
@@ -687,6 +700,7 @@ async function collectExperimentalGenerationImages(args: {
         cookie: args.cookie,
         settings: args.settings,
         aspectRatio: args.aspectRatio,
+        preferDataUrl: args.responseFormat !== "url",
       }),
   );
   const rawUrls: string[] = [];
@@ -942,6 +956,7 @@ function createExperimentalImageEventStream(args: {
               cookie: args.cookie,
               settings: args.settings,
               aspectRatio: args.aspectRatio,
+              preferDataUrl: args.responseFormat !== "url",
               progressCb: ({ index, progress }) => {
                 emitPartial(toOutIndex(plan.offset, index), progress);
               },
