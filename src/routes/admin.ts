@@ -862,52 +862,49 @@ adminRoutes.post("/api/v1/admin/tokens/nsfw/enable", requireAdminAuth, async (c)
     for (let i = 0; i < tokens.length; i += batchSize) {
       const batch = tokens.slice(i, i + batchSize);
       const settled = await runTasksSettledWithLimit(batch, maxConcurrent, async (token) => {
+        const formatGrpc = (r: { http_status: number; grpc_status: number | null; error: string | null }) => {
+          const parts: string[] = [];
+          if (r.http_status) parts.push(`http=${r.http_status}`);
+          if (typeof r.grpc_status === "number") parts.push(`grpc=${r.grpc_status}`);
+          if (r.error) parts.push(`err=${r.error}`);
+          return parts.join(" ") || "unknown";
+        };
+
+        const formatHttp = (r: { http_status: number; error: string | null }) => {
+          const parts: string[] = [];
+          if (r.http_status) parts.push(`http=${r.http_status}`);
+          if (r.error) parts.push(`err=${r.error}`);
+          return parts.join(" ") || "unknown";
+        };
+
+        // 1) Try enabling directly first to avoid touching accounts.x.ai unless required.
+        const first = await enableNsfw({ token, cfCookie: cf, timeoutMs: 15_000 });
+        if (first.success) {
+          await addTokenTag(c.env.DB, token, "nsfw");
+          await markTokenAccountSettingsSuccess(c.env.DB, token);
+          return first;
+        }
+
+        // 2) Best-effort: accept TOS + set birth date, then retry enable.
         const tos = await acceptTos({ token, cfCookie: cf, timeoutMs: 15_000 });
-        if (!tos.ok) {
-          await markTokenAccountSettingsFailure(
-            c.env.DB,
-            token,
-            `nsfw_enable_failed step=tos error=${tos.error ?? `HTTP ${tos.http_status}`}`,
-          );
-          return {
-            success: false,
-            http_status: tos.http_status,
-            grpc_status: tos.grpc_status,
-            grpc_message: tos.grpc_message,
-            error: `tos failed: ${tos.error ?? `HTTP ${tos.http_status}`}`,
-          };
-        }
-
         const birth = await setBirthDate({ token, cfCookie: cf, timeoutMs: 15_000 });
-        if (!birth.ok) {
-          await markTokenAccountSettingsFailure(
-            c.env.DB,
-            token,
-            `nsfw_enable_failed step=birth error=${birth.error ?? `HTTP ${birth.http_status}`}`,
-          );
-          return {
-            success: false,
-            http_status: birth.http_status,
-            grpc_status: null,
-            grpc_message: null,
-            error: `birth-date failed: ${birth.error ?? `HTTP ${birth.http_status}`}`,
-          };
+        const second = await enableNsfw({ token, cfCookie: cf, timeoutMs: 15_000 });
+
+        if (second.success) {
+          await addTokenTag(c.env.DB, token, "nsfw");
+          await markTokenAccountSettingsSuccess(c.env.DB, token);
+          return second;
         }
 
-        const result = await enableNsfw({ token, cfCookie: cf, timeoutMs: 15_000 });
-        if (!result.success) {
-          await markTokenAccountSettingsFailure(
-            c.env.DB,
-            token,
-            `nsfw_enable_failed step=nsfw error=${result.error ?? `HTTP ${result.http_status}`}`,
-          );
-          result.error = `nsfw enable failed: ${result.error ?? `HTTP ${result.http_status}`}`;
-          return result;
-        }
-
-        await addTokenTag(c.env.DB, token, "nsfw");
-        await markTokenAccountSettingsSuccess(c.env.DB, token);
-        return result;
+        const detail = `enable_first(${formatGrpc(first)}); tos(${formatGrpc(tos)}); birth(${formatHttp(birth)}); enable_retry(${formatGrpc(second)})`;
+        await markTokenAccountSettingsFailure(c.env.DB, token, `nsfw_enable_failed ${detail}`);
+        return {
+          success: false,
+          http_status: second.http_status || first.http_status || tos.http_status || birth.http_status || 0,
+          grpc_status: second.grpc_status ?? first.grpc_status ?? tos.grpc_status ?? null,
+          grpc_message: second.grpc_message ?? first.grpc_message ?? tos.grpc_message ?? null,
+          error: `nsfw enable failed: ${detail}`,
+        };
       });
 
       for (let j = 0; j < batch.length; j++) {
