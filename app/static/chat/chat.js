@@ -1135,6 +1135,7 @@ async function streamImage(endpoint, body, headers) {
   const cardMap = new Map();
   const completedSet = new Set();
   let rendered = 0;
+  let streamError = '';
   let buf = '';
 
   while (true) {
@@ -1158,7 +1159,10 @@ async function streamImage(endpoint, body, headers) {
 
       const payload = dataLines.join('\n').trim();
       if (!payload) continue;
-      if (payload === '[DONE]') return rendered;
+      if (payload === '[DONE]') {
+        if (!rendered && streamError) throw new Error(streamError);
+        return rendered;
+      }
 
       let obj = null;
       try {
@@ -1170,6 +1174,12 @@ async function streamImage(endpoint, body, headers) {
       const type = String(obj?.type || event || '').trim();
       const idx = Math.max(0, Number(obj?.index) || 0);
       const card = ensureImageCard(cardMap, idx);
+
+      if (type === 'image_generation.error') {
+        const msg = String(obj?.message || '').trim();
+        if (msg) streamError = msg;
+        continue;
+      }
 
       if (type === 'image_generation.partial_image') {
         updateImageCardProgress(card, obj?.progress ?? 0);
@@ -1188,6 +1198,7 @@ async function streamImage(endpoint, body, headers) {
     }
   }
 
+  if (!rendered && streamError) throw new Error(streamError);
   return rendered;
 }
 

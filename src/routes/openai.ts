@@ -336,6 +336,43 @@ async function convertRawUrlByFormat(
   return fetchImageAsBase64({ rawUrl, cookie: args.cookie, settings: args.settings });
 }
 
+async function convertRawUrlsByFormatBestEffort(args: {
+  rawUrls: string[];
+  responseFormat: ImageResponseFormat;
+  baseUrl: string;
+  cookie: string;
+  settings: Awaited<ReturnType<typeof getSettings>>["grok"];
+}): Promise<string[]> {
+  const settled = await Promise.allSettled(
+    args.rawUrls.map((rawUrl) =>
+      convertRawUrlByFormat(rawUrl, args.responseFormat, {
+        baseUrl: args.baseUrl,
+        cookie: args.cookie,
+        settings: args.settings,
+      }),
+    ),
+  );
+
+  const out: string[] = [];
+  let firstError = "";
+  for (const item of settled) {
+    if (item.status === "fulfilled") {
+      const v = String(item.value || "").trim();
+      if (v) out.push(v);
+      continue;
+    }
+    if (!firstError) {
+      const reason = item.reason;
+      firstError = reason instanceof Error ? reason.message : String(reason);
+    }
+  }
+
+  if (!out.length && firstError) {
+    throw new Error(firstError);
+  }
+  return out;
+}
+
 async function collectImageUrls(resp: Response): Promise<string[]> {
   const text = await resp.text();
   const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
@@ -587,15 +624,13 @@ async function runImageCall(args: {
     throw new Error(`Upstream ${upstream.status}: ${txt.slice(0, 200)}`);
   }
   const rawUrls = await collectImageUrls(upstream);
-  const converted = await Promise.all(
-    rawUrls.map((rawUrl) =>
-      convertRawUrlByFormat(rawUrl, args.responseFormat, {
-        baseUrl: args.baseUrl,
-        cookie: args.cookie,
-        settings: args.settings,
-      }),
-    ),
-  );
+  const converted = await convertRawUrlsByFormatBestEffort({
+    rawUrls,
+    responseFormat: args.responseFormat,
+    baseUrl: args.baseUrl,
+    cookie: args.cookie,
+    settings: args.settings,
+  });
   return converted.filter(Boolean);
 }
 
@@ -666,16 +701,13 @@ async function collectExperimentalGenerationImages(args: {
     throw new Error("Experimental imagine websocket returned no images");
   }
   const dedupedRawUrls = dedupeImages(rawUrls);
-
-  const converted = await Promise.all(
-    dedupedRawUrls.map((rawUrl) =>
-      convertRawUrlByFormat(rawUrl, args.responseFormat, {
-        baseUrl: args.baseUrl,
-        cookie: args.cookie,
-        settings: args.settings,
-      }),
-    ),
-  );
+  const converted = await convertRawUrlsByFormatBestEffort({
+    rawUrls: dedupedRawUrls,
+    responseFormat: args.responseFormat,
+    baseUrl: args.baseUrl,
+    cookie: args.cookie,
+    settings: args.settings,
+  });
   return dedupeImages(converted.filter(Boolean));
 }
 
@@ -694,15 +726,13 @@ async function runExperimentalImageEditCall(args: {
     settings: args.settings,
   });
   const rawUrls = await collectImageUrls(upstream);
-  const converted = await Promise.all(
-    rawUrls.map((rawUrl) =>
-      convertRawUrlByFormat(rawUrl, args.responseFormat, {
-        baseUrl: args.baseUrl,
-        cookie: args.cookie,
-        settings: args.settings,
-      }),
-    ),
-  );
+  const converted = await convertRawUrlsByFormatBestEffort({
+    rawUrls,
+    responseFormat: args.responseFormat,
+    baseUrl: args.baseUrl,
+    cookie: args.cookie,
+    settings: args.settings,
+  });
   return converted.filter(Boolean);
 }
 
@@ -916,13 +946,17 @@ function createExperimentalImageEventStream(args: {
                 emitPartial(toOutIndex(plan.offset, index), progress);
               },
               completedCb: async ({ index, url }) => {
-                const converted = await convertRawUrlByFormat(url, args.responseFormat, {
-                  baseUrl: args.baseUrl,
-                  cookie: args.cookie,
-                  settings: args.settings,
-                });
-                if (converted) {
-                  emitCompleted(toOutIndex(plan.offset, index), converted);
+                try {
+                  const converted = await convertRawUrlByFormat(url, args.responseFormat, {
+                    baseUrl: args.baseUrl,
+                    cookie: args.cookie,
+                    settings: args.settings,
+                  });
+                  if (converted) {
+                    emitCompleted(toOutIndex(plan.offset, index), converted);
+                  }
+                } catch {
+                  // Ignore single-image conversion failures; keep stream alive.
                 }
               },
             });
@@ -936,13 +970,17 @@ function createExperimentalImageEventStream(args: {
           for (let i = 0; i < rawUrls.length; i++) {
             const outIndex = toOutIndex(plan.offset, i);
             if (completedByIndex.has(outIndex)) continue;
-            const converted = await convertRawUrlByFormat(rawUrls[i] ?? "", args.responseFormat, {
-              baseUrl: args.baseUrl,
-              cookie: args.cookie,
-              settings: args.settings,
-            });
-            if (converted) {
-              emitCompleted(outIndex, converted);
+            try {
+              const converted = await convertRawUrlByFormat(rawUrls[i] ?? "", args.responseFormat, {
+                baseUrl: args.baseUrl,
+                cookie: args.cookie,
+                settings: args.settings,
+              });
+              if (converted) {
+                emitCompleted(outIndex, converted);
+              }
+            } catch {
+              // Ignore single-image conversion failures; keep stream alive.
             }
           }
         }
