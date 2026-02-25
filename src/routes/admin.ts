@@ -30,6 +30,8 @@ import {
   expireToken,
   getAllTags,
   listTokens,
+  markTokenAccountSettingsFailure,
+  markTokenAccountSettingsSuccess,
   recordTokenFailure,
   selectBestToken,
   tokenRowToInfo,
@@ -909,6 +911,12 @@ adminRoutes.post("/api/v1/admin/tokens/nsfw/refresh", requireAdminAuth, async (c
   try {
     const body = (await c.req.json().catch(() => ({}))) as any;
     const wantAll = Boolean(body && typeof body === "object" && body.all);
+    const invalidateOnFailRaw = body && typeof body === "object" ? (body as any).invalidate_on_fail : undefined;
+    const invalidateOnFail =
+      invalidateOnFailRaw === true ||
+      invalidateOnFailRaw === 1 ||
+      invalidateOnFailRaw === "1" ||
+      String(invalidateOnFailRaw ?? "").toLowerCase() === "true";
 
     const incoming: string[] = [];
     if (!wantAll && body && typeof body === "object") {
@@ -975,7 +983,7 @@ adminRoutes.post("/api/v1/admin/tokens/nsfw/refresh", requireAdminAuth, async (c
           }
 
           await addTokenTag(c.env.DB, token, "nsfw");
-          await clearTokenFailureState(c.env.DB, token);
+          await markTokenAccountSettingsSuccess(c.env.DB, token);
           return { token, ok: true, attempts: attempt };
         } catch (e) {
           lastStep = "exception";
@@ -984,14 +992,16 @@ adminRoutes.post("/api/v1/admin/tokens/nsfw/refresh", requireAdminAuth, async (c
       }
 
       const reason = `account_settings_refresh_failed step=${lastStep} attempts=${maxAttempts} error=${lastError}`;
-      const invalidated = await expireToken(c.env.DB, token, reason);
+      const invalidated = invalidateOnFail
+        ? await expireToken(c.env.DB, token, reason)
+        : await markTokenAccountSettingsFailure(c.env.DB, token, reason);
       return {
         token,
         ok: false,
         attempts: maxAttempts,
         step: lastStep,
         error: lastError,
-        invalidated: Boolean(invalidated),
+        invalidated: Boolean(invalidateOnFail && invalidated),
       };
     };
 
@@ -1019,15 +1029,20 @@ adminRoutes.post("/api/v1/admin/tokens/nsfw/refresh", requireAdminAuth, async (c
         const token = tokens[i] as string;
         const msg = item.reason instanceof Error ? item.reason.message : String(item.reason);
         const reason = `account_settings_refresh_failed step=exception attempts=${maxAttempts} error=${msg}`;
-        const inv = await expireToken(c.env.DB, token, reason);
-        if (inv) invalidated += 1;
+        let inv = false;
+        if (invalidateOnFail) {
+          inv = Boolean(await expireToken(c.env.DB, token, reason));
+          if (inv) invalidated += 1;
+        } else {
+          await markTokenAccountSettingsFailure(c.env.DB, token, reason);
+        }
         failed.push({
           token,
           ok: false,
           attempts: maxAttempts,
           step: "exception",
           error: msg,
-          invalidated: Boolean(inv),
+          invalidated: Boolean(invalidateOnFail && inv),
         });
       }
     }
@@ -1044,6 +1059,59 @@ adminRoutes.post("/api/v1/admin/tokens/nsfw/refresh", requireAdminAuth, async (c
     });
   } catch (e) {
     return c.json(legacyErr(`NSFW refresh failed: ${e instanceof Error ? e.message : String(e)}`), 500);
+  }
+});
+
+adminRoutes.post("/api/v1/admin/tokens/failures/clear", requireAdminAuth, async (c) => {
+  try {
+    const body = (await c.req.json().catch(() => ({}))) as any;
+    const wantAll = Boolean(body && typeof body === "object" && body.all);
+    const onlyExpiredRaw = body && typeof body === "object" ? (body as any).only_expired : undefined;
+    const onlyExpired = onlyExpiredRaw === undefined ? true : Boolean(onlyExpiredRaw);
+
+    const hasReasonPrefix =
+      body && typeof body === "object" && Object.prototype.hasOwnProperty.call(body, "reason_prefix");
+    const reasonPrefixRaw = body && typeof body === "object" ? (body as any).reason_prefix : undefined;
+    const reasonPrefixValue = typeof reasonPrefixRaw === "string" ? reasonPrefixRaw.trim() : "";
+    const reasonPrefix = wantAll && !hasReasonPrefix ? "account_settings_refresh_failed" : reasonPrefixValue;
+
+    const incoming: string[] = [];
+    if (!wantAll && body && typeof body === "object") {
+      if (typeof body.token === "string") incoming.push(body.token);
+      if (Array.isArray(body.tokens)) incoming.push(...body.tokens.filter((x: any) => typeof x === "string"));
+    }
+    const tokens = [...new Set(incoming.map((t) => normalizeSsoToken(t)).filter(Boolean))];
+
+    let changes = 0;
+    if (wantAll) {
+      const where: string[] = ["1=1"];
+      const params: unknown[] = [];
+      if (onlyExpired) where.push("status = 'expired'");
+      if (reasonPrefix) {
+        where.push("last_failure_reason LIKE ?");
+        params.push(`${reasonPrefix}%`);
+      }
+      const sql = `UPDATE tokens SET failed_count = 0, cooldown_until = NULL, last_failure_time = NULL, last_failure_reason = NULL, status = 'active' WHERE ${where.join(
+        " AND ",
+      )}`;
+      const res = await c.env.DB.prepare(sql).bind(...params).run();
+      changes = Number((res as any)?.meta?.changes ?? 0);
+    } else {
+      if (!tokens.length) return c.json(legacyErr("No tokens provided"), 400);
+      const placeholders = tokens.map(() => "?").join(",");
+      const sql = `UPDATE tokens SET failed_count = 0, cooldown_until = NULL, last_failure_time = NULL, last_failure_reason = NULL, status = 'active' WHERE token IN (${placeholders})`;
+      const res = await c.env.DB.prepare(sql).bind(...tokens).run();
+      changes = Number((res as any)?.meta?.changes ?? 0);
+    }
+
+    return c.json({
+      status: "success",
+      summary: wantAll
+        ? { all: true, cleared: changes, only_expired: onlyExpired, reason_prefix: reasonPrefix }
+        : { all: false, requested: tokens.length, cleared: changes },
+    });
+  } catch (e) {
+    return c.json(legacyErr(`Clear token failures failed: ${e instanceof Error ? e.message : String(e)}`), 500);
   }
 });
 

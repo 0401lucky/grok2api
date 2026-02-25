@@ -66,3 +66,9 @@ config.local.toml
 
 # Local tooling
 .ace-tool/
+
+# Local caches / reference repos
+.npm-cache/
+.uv-cache/
+_ref_grok2api-rs/
+tmp_grok2api_rs/

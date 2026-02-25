@@ -444,6 +444,21 @@ class TokenManager:
             await self._save()
         return True
 
+    async def mark_token_account_settings_failure(self, token_str: str, reason: str = "", save: bool = True) -> bool:
+        """Record account-settings failure without invalidating the token."""
+        token, raw_token = self._find_token_info(token_str)
+        if not token:
+            logger.warning(f"Token {raw_token[:10]}...: not found for account-settings failure")
+            return False
+
+        token.last_fail_at = int(datetime.now().timestamp() * 1000)
+        if reason:
+            token.last_fail_reason = str(reason)[:500]
+
+        if save:
+            await self._save()
+        return True
+
     async def add_tag(self, token_str: str, tag: str, save: bool = True) -> bool:
         """为 Token 添加标签（幂等）。"""
         token, raw_token = self._find_token_info(token_str)

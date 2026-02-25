@@ -136,9 +136,11 @@ class AccountSettingsRefreshService:
         tokens: Iterable[str],
         concurrency: int = DEFAULT_NSFW_REFRESH_CONCURRENCY,
         retries: int = DEFAULT_NSFW_REFRESH_RETRIES,
+        invalidate_on_fail: bool = False,
     ) -> dict[str, Any]:
         resolved_concurrency = _coerce_concurrency(concurrency)
         resolved_retries = _coerce_retries(retries)
+        resolved_invalidate_on_fail = bool(invalidate_on_fail)
 
         unique_tokens: list[str] = []
         seen: set[str] = set()
@@ -192,11 +194,19 @@ class AccountSettingsRefreshService:
                     f"account_settings_refresh_failed step={last_step} "
                     f"attempts={max_attempts} error={last_error}"
                 )
-                invalidated = await self.token_manager.set_token_invalid(
-                    token,
-                    reason=reason,
-                    save=False,
-                )
+                if resolved_invalidate_on_fail:
+                    invalidated = await self.token_manager.set_token_invalid(
+                        token,
+                        reason=reason,
+                        save=False,
+                    )
+                else:
+                    await self.token_manager.mark_token_account_settings_failure(
+                        token,
+                        reason=reason,
+                        save=False,
+                    )
+                    invalidated = False
                 return {
                     "token": token,
                     "ok": False,
@@ -231,6 +241,7 @@ async def refresh_account_settings_for_tokens(
     tokens: Iterable[str],
     concurrency: int | None = None,
     retries: int | None = None,
+    invalidate_on_fail: bool = False,
 ) -> dict[str, Any]:
     resolved_concurrency = _coerce_concurrency(
         concurrency if concurrency is not None else get_config(
@@ -254,6 +265,7 @@ async def refresh_account_settings_for_tokens(
         tokens=tokens,
         concurrency=resolved_concurrency,
         retries=resolved_retries,
+        invalidate_on_fail=invalidate_on_fail,
     )
 
 

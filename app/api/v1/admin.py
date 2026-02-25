@@ -975,15 +975,107 @@ async def refresh_tokens_nsfw_api(data: dict):
 
     concurrency = _resolve_nsfw_refresh_concurrency(payload.get("concurrency"))
     retries = _resolve_nsfw_refresh_retries(payload.get("retries"))
+    invalidate_raw = payload.get("invalidate_on_fail")
+    invalidate_on_fail = (
+        invalidate_raw is True
+        or invalidate_raw == 1
+        or invalidate_raw == "1"
+        or str(invalidate_raw or "").strip().lower() == "true"
+    )
     result = await refresh_account_settings_for_tokens(
         tokens=tokens,
         concurrency=concurrency,
         retries=retries,
+        invalidate_on_fail=invalidate_on_fail,
     )
     return {
         "status": "success",
         "summary": result.get("summary") or {},
         "failed": result.get("failed") or [],
+    }
+
+
+@router.post("/api/v1/admin/tokens/failures/clear", dependencies=[Depends(verify_api_key)])
+async def clear_token_failures_api(data: dict):
+    """Clear token failure state / restore expired tokens (admin helper)."""
+    payload = data if isinstance(data, dict) else {}
+    mgr = await get_token_manager()
+
+    want_all = bool(payload.get("all"))
+    only_expired_raw = payload.get("only_expired")
+    only_expired = True if only_expired_raw is None else bool(only_expired_raw)
+
+    has_reason_prefix = isinstance(payload, dict) and ("reason_prefix" in payload)
+    reason_prefix_raw = payload.get("reason_prefix")
+    reason_prefix_value = reason_prefix_raw.strip() if isinstance(reason_prefix_raw, str) else ""
+    reason_prefix = "account_settings_refresh_failed" if want_all and not has_reason_prefix else reason_prefix_value
+
+    tokens: list[str] = []
+    if not want_all:
+        candidates: list[str] = []
+        single = payload.get("token")
+        if isinstance(single, str):
+            candidates.append(single)
+        batch = payload.get("tokens")
+        if isinstance(batch, list):
+            candidates.extend([item for item in batch if isinstance(item, str)])
+
+        seen: set[str] = set()
+        for raw in candidates:
+            token = normalize_refresh_token(str(raw or "").strip())
+            if not token or token in seen:
+                continue
+            seen.add(token)
+            tokens.append(token)
+
+        if not tokens:
+            raise HTTPException(status_code=400, detail="No tokens provided")
+
+    cleared = 0
+    if want_all:
+        for pool in mgr.pools.values():
+            for info in pool.list():
+                token = normalize_refresh_token(str(info.token or "").strip())
+                if not token:
+                    continue
+
+                if only_expired and str(getattr(info, "status", "") or "") != "expired":
+                    continue
+                if reason_prefix:
+                    last_reason = getattr(info, "last_fail_reason", None)
+                    if not (isinstance(last_reason, str) and last_reason.startswith(reason_prefix)):
+                        continue
+
+                ok = await mgr.mark_token_account_settings_success(token, save=False)
+                if ok:
+                    cleared += 1
+    else:
+        for token in tokens:
+            ok = await mgr.mark_token_account_settings_success(token, save=False)
+            if ok:
+                cleared += 1
+
+    try:
+        await mgr.commit()
+    except Exception as exc:
+        logger.warning("Clear token failures commit failed: {}", exc)
+
+    return {
+        "status": "success",
+        "summary": (
+            {
+                "all": True,
+                "cleared": cleared,
+                "only_expired": only_expired,
+                "reason_prefix": reason_prefix,
+            }
+            if want_all
+            else {
+                "all": False,
+                "requested": len(tokens),
+                "cleared": cleared,
+            }
+        ),
     }
 
 

@@ -159,6 +159,34 @@ export async function clearTokenFailureState(db: Env["DB"], token: string): Prom
   return true;
 }
 
+export async function markTokenAccountSettingsSuccess(db: Env["DB"], token: string): Promise<boolean> {
+  const exists = await dbFirst<{ token: string }>(db, "SELECT token FROM tokens WHERE token = ?", [token]);
+  if (!exists) return false;
+  await dbRun(
+    db,
+    "UPDATE tokens SET failed_count = 0, last_failure_time = NULL, last_failure_reason = NULL, status = 'active' WHERE token = ?",
+    [token],
+  );
+  return true;
+}
+
+export async function markTokenAccountSettingsFailure(
+  db: Env["DB"],
+  token: string,
+  reason: string,
+): Promise<boolean> {
+  const exists = await dbFirst<{ token: string }>(db, "SELECT token FROM tokens WHERE token = ?", [token]);
+  if (!exists) return false;
+  const now = nowMs();
+  const msg = String(reason ?? "").slice(0, 500);
+  await dbRun(db, "UPDATE tokens SET last_failure_time = ?, last_failure_reason = ? WHERE token = ?", [
+    now,
+    msg,
+    token,
+  ]);
+  return true;
+}
+
 export async function expireToken(db: Env["DB"], token: string, reason: string): Promise<boolean> {
   const exists = await dbFirst<{ token: string }>(db, "SELECT token FROM tokens WHERE token = ?", [token]);
   if (!exists) return false;

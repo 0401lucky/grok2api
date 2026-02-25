@@ -29,10 +29,11 @@ def test_nsfw_refresh_api_all_mode_uses_all_tokens(monkeypatch):
     async def _fake_get_token_manager():
         return mgr
 
-    async def _fake_refresh(tokens, concurrency=None, retries=None):
+    async def _fake_refresh(tokens, concurrency=None, retries=None, invalidate_on_fail=False):
         captured["tokens"] = tokens
         captured["concurrency"] = concurrency
         captured["retries"] = retries
+        captured["invalidate_on_fail"] = invalidate_on_fail
         return {
             "summary": {"total": len(tokens), "success": len(tokens), "failed": 0, "invalidated": 0},
             "failed": [],
@@ -51,6 +52,7 @@ def test_nsfw_refresh_api_all_mode_uses_all_tokens(monkeypatch):
     assert captured["tokens"] == ["token-a", "token-b", "token-c"]
     assert captured["concurrency"] == 5
     assert captured["retries"] == 1
+    assert captured["invalidate_on_fail"] is False
 
 
 def test_nsfw_refresh_api_token_list_mode_normalizes_tokens(monkeypatch):
@@ -60,8 +62,9 @@ def test_nsfw_refresh_api_token_list_mode_normalizes_tokens(monkeypatch):
     async def _fake_get_token_manager():
         return mgr
 
-    async def _fake_refresh(tokens, concurrency=None, retries=None):
+    async def _fake_refresh(tokens, concurrency=None, retries=None, invalidate_on_fail=False):
         captured["tokens"] = tokens
+        captured["invalidate_on_fail"] = invalidate_on_fail
         return {
             "summary": {"total": len(tokens), "success": 1, "failed": 1, "invalidated": 1},
             "failed": [{"token": "token-b", "step": "nsfw", "error": "forbidden", "attempts": 4}],
@@ -78,3 +81,4 @@ def test_nsfw_refresh_api_token_list_mode_normalizes_tokens(monkeypatch):
     assert result["summary"]["failed"] == 1
     assert result["summary"]["invalidated"] == 1
     assert captured["tokens"] == ["token-a", "token-b"]
+    assert captured["invalidate_on_fail"] is False

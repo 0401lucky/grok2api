@@ -14,6 +14,7 @@ let autoRegisterLastAdded = 0;
 let liveStatsTimer = null;
 let isWorkersRuntime = false;
 let isNsfwRefreshAllRunning = false;
+let isNsfwClearFailuresRunning = false;
 
 let displayTokens = [];
 const filterState = {
@@ -233,13 +234,16 @@ function setAutoRegisterUiEnabled(enabled) {
 }
 
 function setNsfwRefreshUiEnabled(enabled) {
-  const btn = document.getElementById('btn-refresh-nsfw-all');
-  if (!btn) return;
-  if (enabled) {
-    btn.classList.remove('hidden');
-  } else {
-    btn.classList.add('hidden');
-  }
+  ['btn-refresh-nsfw-all', 'btn-clear-nsfw-failures']
+    .forEach((id) => {
+      const btn = document.getElementById(id);
+      if (!btn) return;
+      if (enabled) {
+        btn.classList.remove('hidden');
+      } else {
+        btn.classList.add('hidden');
+      }
+    });
 }
 
 async function detectWorkersRuntime() {
@@ -1327,7 +1331,7 @@ async function refreshAllNsfw() {
   }
 
   const ok = await confirmAction(
-    '将对全部 Token 执行：同意用户协议 + 设置年龄 + 开启 NSFW。未成功的 Token 会自动标记为失效，是否继续？',
+    '将对全部 Token 执行：同意用户协议 + 设置年龄 + 开启 NSFW。失败的 Token 不会自动标记为失效（仅记录失败原因），是否继续？',
     { okText: '开始刷新' }
   );
   if (!ok) return;
@@ -1347,7 +1351,7 @@ async function refreshAllNsfw() {
         'Content-Type': 'application/json',
         ...buildAuthHeaders(apiKey)
       },
-      body: JSON.stringify({ all: true })
+      body: JSON.stringify({ all: true, invalidate_on_fail: false })
     });
 
     const payload = await parseJsonSafely(res);
@@ -1373,6 +1377,57 @@ async function refreshAllNsfw() {
     if (btn) {
       btn.disabled = false;
       btn.innerHTML = originalText || '一键刷新 NSFW';
+    }
+  }
+}
+
+async function clearNsfwRefreshFailures() {
+  if (isNsfwClearFailuresRunning) {
+    showToast('恢复任务进行中', 'info');
+    return;
+  }
+
+  const ok = await confirmAction(
+    '将恢复因 “NSFW 刷新” 被误标为失效的 Token（默认仅处理失败原因以 account_settings_refresh_failed 开头的失效 Token），是否继续？',
+    { okText: '开始恢复' }
+  );
+  if (!ok) return;
+
+  const btn = document.getElementById('btn-clear-nsfw-failures');
+  const originalText = btn ? btn.innerHTML : '';
+  isNsfwClearFailuresRunning = true;
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '恢复中...';
+  }
+
+  try {
+    const res = await fetch('/api/v1/admin/tokens/failures/clear', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...buildAuthHeaders(apiKey)
+      },
+      body: JSON.stringify({ all: true })
+    });
+
+    const payload = await parseJsonSafely(res);
+    if (!res.ok || payload?.status !== 'success') {
+      showToast(extractApiErrorMessage(payload, payload?.detail || `HTTP ${res.status}`), 'error');
+      return;
+    }
+
+    const summary = payload?.summary || {};
+    const cleared = Number(summary.cleared || 0);
+    showToast(`恢复完成：已恢复 ${cleared} 个 Token`, cleared > 0 ? 'success' : 'info');
+    loadData();
+  } catch (e) {
+    showToast(e?.message ? `恢复失败: ${e.message}` : '恢复失败', 'error');
+  } finally {
+    isNsfwClearFailuresRunning = false;
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = originalText || '恢复误伤 Token';
     }
   }
 }
