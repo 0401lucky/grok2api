@@ -18,6 +18,7 @@ import {
 } from "../grok/imagineExperimental";
 import { addRequestLog } from "../repo/logs";
 import {
+  addTokenTag,
   applyCooldown,
   listCandidateTokens,
   listCandidateTokensWithTag,
@@ -1737,7 +1738,19 @@ openAiRoutes.post("/images/generations/nsfw", async (c) => {
     });
     if (!quota.ok) return quota.resp;
 
-    const candidates = await listCandidateTokensWithTag(c.env.DB, requestedModel, 10, "nsfw");
+    let candidates = await listCandidateTokensWithTag(c.env.DB, requestedModel, 10, "nsfw");
+    let fallbackUsed = false;
+    if (!candidates.length) {
+      // Fallback for externally prepared accounts:
+      // account may already have NSFW enabled upstream but local `tags` not yet synced.
+      candidates = await listCandidateTokens(c.env.DB, requestedModel, 10);
+      fallbackUsed = true;
+      if (candidates.length) {
+        console.warn(
+          "NSFW route fallback: no local `nsfw` tag found, using general token candidates.",
+        );
+      }
+    }
     if (!candidates.length) {
       await recordImageLog({
         env: c.env,
@@ -1749,7 +1762,9 @@ openAiRoutes.post("/images/generations/nsfw", async (c) => {
         error: "NO_AVAILABLE_TOKEN",
       });
 
-      const noTokenMessage = "No NSFW-enabled token (tag: nsfw). Enable NSFW in admin first.";
+      const noTokenMessage = fallbackUsed
+        ? "No available token."
+        : "No NSFW-enabled token (tag: nsfw). Enable NSFW in admin first.";
       if (stream) {
         return new Response(
           createStreamErrorImageEventStream({
@@ -1777,6 +1792,13 @@ openAiRoutes.post("/images/generations/nsfw", async (c) => {
             aspectRatio,
             concurrency,
           });
+          if (fallbackUsed) {
+            try {
+              await addTokenTag(c.env.DB, cand.token, "nsfw");
+            } catch {
+              // best-effort only
+            }
+          }
           const selected = pickImageResults(urls, n);
           return { selected, token: cand.token };
         } catch (e) {

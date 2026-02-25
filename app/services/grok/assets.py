@@ -28,6 +28,7 @@ from app.core.exceptions import (
     UpstreamException, 
     ValidationException
 )
+from app.services.grok.cookie import build_auth_cookie
 from app.services.grok.statsig import StatsigService
 
 
@@ -181,9 +182,8 @@ class BaseService:
         headers["x-xai-request-id"] = str(uuid.uuid4())
         
         # Cookie
-        token = token[4:] if token.startswith("sso=") else token
         cf = get_config("grok.cf_clearance", "")
-        headers["Cookie"] = f"sso={token};cf_clearance={cf}" if cf else f"sso={token}"
+        headers["Cookie"] = build_auth_cookie(token, cf)
         
         return headers
     
@@ -204,9 +204,8 @@ class BaseService:
         }
         
         # Cookie
-        token = token[4:] if token.startswith("sso=") else token
         cf = get_config("grok.cf_clearance", "")
-        headers["Cookie"] = f"sso={token};cf_clearance={cf}" if cf else f"sso={token}"
+        headers["Cookie"] = build_auth_cookie(token, cf)
         
         return headers
     

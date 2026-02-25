@@ -807,12 +807,42 @@ async def create_image_nsfw(
 
     token_mgr, primary = await _get_token_for_model(model_id)
 
-    # 构造候选 token 列表：primary 优先，其余按 pool 顺序追加。
-    candidates: list[str] = []
+    def _has_nsfw_tag(info: Any) -> bool:
+        tags_raw = getattr(info, "tags", [])
+        if isinstance(tags_raw, list):
+            for raw in tags_raw:
+                if str(raw or "").strip().lower() == "nsfw":
+                    return True
+        elif isinstance(tags_raw, str):
+            return str(tags_raw or "").strip().lower() == "nsfw"
+        return False
+
+    # 构造候选 token 列表：优先 NSFW-tag token（若存在），否则回退全部可用 token。
+    ordered: list[tuple[str, bool]] = []
     seen: set[str] = set()
+
+    def _append_candidate(token_raw: str, has_nsfw_tag: bool):
+        token = str(token_raw or "").strip()
+        if not token:
+            return
+        if token.startswith("sso="):
+            token = token[4:]
+        if not token or token in seen:
+            return
+        seen.add(token)
+        ordered.append((token, bool(has_nsfw_tag)))
+
+    primary_tagged = False
     if primary:
-        candidates.append(primary)
-        seen.add(primary)
+        for pool in token_mgr.pools.values():
+            try:
+                found = pool.get(primary)
+            except Exception:
+                found = None
+            if found is not None:
+                primary_tagged = _has_nsfw_tag(found)
+                break
+        _append_candidate(primary, primary_tagged)
 
     for pool_name in ModelService.pool_candidates_for_model(model_id):
         pool = token_mgr.pools.get(pool_name)
@@ -824,16 +854,33 @@ async def create_image_nsfw(
                 continue
             if token.startswith("sso="):
                 token = token[4:]
-            if token in seen:
-                continue
             # 只尝试本地认为可用的 token，避免反复打到 cooling/expired
             try:
                 if hasattr(info, "is_available") and not info.is_available():
                     continue
             except Exception:
                 pass
-            seen.add(token)
-            candidates.append(token)
+            _append_candidate(token, _has_nsfw_tag(info))
+
+    tagged_candidates = [token for token, tagged in ordered if tagged]
+    if tagged_candidates:
+        candidates = tagged_candidates
+    else:
+        candidates = [token for token, _ in ordered]
+        logger.warning(
+            "NSFW route did not find tokens tagged `nsfw`; falling back to all available tokens."
+        )
+
+    if not candidates:
+        await _record_request(model_id, False)
+        raise AppException(
+            message="No available tokens for NSFW image generation.",
+            error_type=ErrorType.RATE_LIMIT.value,
+            code="rate_limit_exceeded",
+            status_code=429,
+        )
+
+    stream_primary = candidates[0]
 
     async def _collect_with_failover() -> tuple[str, List[str]]:
         last_exc: Optional[Exception] = None
@@ -858,14 +905,14 @@ async def create_image_nsfw(
 
     if request.stream:
         stream_state: Dict[str, Any] = {"success": False}
-        used_token = primary
+        used_token = stream_primary
 
         async def _wrapped_stream():
             nonlocal used_token
             try:
                 try:
                     async for chunk in _experimental_stream_generation(
-                        token=primary,
+                        token=stream_primary,
                         prompt=request.prompt,
                         n=n,
                         response_format=response_format,
@@ -874,7 +921,7 @@ async def create_image_nsfw(
                         state=stream_state,
                     ):
                         yield chunk
-                    used_token = primary
+                    used_token = stream_primary
                 except Exception as stream_err:
                     logger.warning(
                         f"NSFW experimental realtime stream failed: {stream_err}. "
