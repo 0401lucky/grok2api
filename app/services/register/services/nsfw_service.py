@@ -368,6 +368,7 @@ class NsfwSettingsService:
         user_agent: str,
         cf_clearance: str,
         timeout: int,
+        allow_age_verify: bool = True,
     ) -> Dict[str, Any]:
         # Prefer request shape with explicit FieldMask (field #2), which upstream may require.
         primary_payload = _build_proto_payload(2, NSFW_FEATURES_PATH)
@@ -458,7 +459,9 @@ class NsfwSettingsService:
             f"previous payload failed: {result.get('error')}; "
             f"name-based payload failed: {name_based.get('error')}"
         )
-        if _should_retry_with_age_verify(result) or _should_retry_with_age_verify(name_based):
+        if allow_age_verify and (
+            _should_retry_with_age_verify(result) or _should_retry_with_age_verify(name_based)
+        ):
             age_result = self._verify_age_via_rest(
                 sso=sso,
                 sso_rw=sso_rw,
@@ -468,7 +471,21 @@ class NsfwSettingsService:
                 timeout=timeout,
             )
             if age_result.get("ok"):
-                return age_result
+                retry = self._enable_chain(
+                    sso=sso,
+                    sso_rw=sso_rw,
+                    impersonate=impersonate,
+                    user_agent=user_agent,
+                    cf_clearance=cf_clearance,
+                    timeout=timeout,
+                    allow_age_verify=False,
+                )
+                if retry.get("ok"):
+                    return retry
+                retry["error"] = (
+                    f"age-verify ok; enable retry failed: {retry.get('error') or 'unknown'}"
+                )
+                return retry
             failed_msg = name_based.get("error") or result.get("error")
             age_result["error"] = (
                 f"gRPC update failed: {failed_msg}; "

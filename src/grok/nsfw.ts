@@ -207,47 +207,60 @@ async function enableChain(args: {
   userAgent: string;
   timeoutMs: number;
 }): Promise<NsfwResult> {
-  let result = await sendEnableRequest({
-    ...args,
-    protoPayload: buildProtoPayload(2, NSFW_FEATURES_PATH),
-  });
+  const enableGrpcChain = async (): Promise<NsfwResult> => {
+    let result = await sendEnableRequest({
+      ...args,
+      protoPayload: buildProtoPayload(2, NSFW_FEATURES_PATH),
+    });
+    if (result.success) return result;
+
+    if (shouldRetryWithAlternateMaskField(result)) {
+      const second = await sendEnableRequest({
+        ...args,
+        protoPayload: buildProtoPayload(3, NSFW_FEATURES_PATH),
+      });
+      if (second.success) return second;
+      second.error = `primary payload failed: ${result.error ?? "unknown"}; alternate mask field failed: ${second.error ?? "unknown"}`;
+      result = second;
+    }
+
+    if (shouldRetryWithAlternateMaskPath(result)) {
+      const third = await sendEnableRequest({
+        ...args,
+        protoPayload: buildProtoPayload(2, NSFW_FEATURES_ENABLED_PATH),
+      });
+      if (third.success) return third;
+      third.error = `previous payload failed: ${result.error ?? "unknown"}; alternate mask path failed: ${third.error ?? "unknown"}`;
+      result = third;
+    }
+
+    if (shouldRetryWithLegacyPayload(result)) {
+      const legacy = await sendEnableRequest({
+        ...args,
+        protoPayload: NSFW_PROTO_PAYLOAD_LEGACY,
+      });
+      if (legacy.success) return legacy;
+      legacy.error = `previous payload failed: ${result.error ?? "unknown"}; legacy payload failed: ${legacy.error ?? "unknown"}`;
+      result = legacy;
+    }
+
+    return result;
+  };
+
+  let result = await enableGrpcChain();
   if (result.success) return result;
-
-  if (shouldRetryWithAlternateMaskField(result)) {
-    const second = await sendEnableRequest({
-      ...args,
-      protoPayload: buildProtoPayload(3, NSFW_FEATURES_PATH),
-    });
-    if (second.success) return second;
-    second.error = `primary payload failed: ${result.error ?? "unknown"}; alternate mask field failed: ${second.error ?? "unknown"}`;
-    result = second;
-  }
-
-  if (shouldRetryWithAlternateMaskPath(result)) {
-    const third = await sendEnableRequest({
-      ...args,
-      protoPayload: buildProtoPayload(2, NSFW_FEATURES_ENABLED_PATH),
-    });
-    if (third.success) return third;
-    third.error = `previous payload failed: ${result.error ?? "unknown"}; alternate mask path failed: ${third.error ?? "unknown"}`;
-    result = third;
-  }
-
-  if (shouldRetryWithLegacyPayload(result)) {
-    const legacy = await sendEnableRequest({
-      ...args,
-      protoPayload: NSFW_PROTO_PAYLOAD_LEGACY,
-    });
-    if (legacy.success) return legacy;
-    legacy.error = `previous payload failed: ${result.error ?? "unknown"}; legacy payload failed: ${legacy.error ?? "unknown"}`;
-    result = legacy;
-  }
 
   if (shouldRetryWithAgeVerify(result)) {
     const age = await verifyAgeViaRest(args);
-    if (age.success) return age;
-    age.error = `gRPC update failed: ${result.error ?? "unknown"}; age-verify fallback failed: ${age.error ?? "unknown"}`;
-    result = age;
+    if (!age.success) {
+      age.error = `gRPC update failed: ${result.error ?? "unknown"}; age-verify fallback failed: ${age.error ?? "unknown"}`;
+      return age;
+    }
+
+    const afterAge = await enableGrpcChain();
+    if (afterAge.success) return afterAge;
+    afterAge.error = `age-verify ok; enable retry failed: ${afterAge.error ?? "unknown"}`;
+    return afterAge;
   }
 
   return result;
@@ -279,4 +292,3 @@ export async function enableNsfw(args: {
 
   return first;
 }
-
