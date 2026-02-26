@@ -22,19 +22,8 @@ BROWSER = "chrome136"
 TIMEOUT = 10
 DEFAULT_MAX_CONCURRENT = 25
 _USAGE_SEMAPHORE = asyncio.Semaphore(DEFAULT_MAX_CONCURRENT)
-_USAGE_SEM_VALUE = DEFAULT_MAX_CONCURRENT
 
 def _get_usage_semaphore() -> asyncio.Semaphore:
-    global _USAGE_SEMAPHORE, _USAGE_SEM_VALUE
-    value = get_config("performance.usage_max_concurrent", DEFAULT_MAX_CONCURRENT)
-    try:
-        value = int(value)
-    except Exception:
-        value = DEFAULT_MAX_CONCURRENT
-    value = max(1, value)
-    if value != _USAGE_SEM_VALUE:
-        _USAGE_SEM_VALUE = value
-        _USAGE_SEMAPHORE = asyncio.Semaphore(value)
     return _USAGE_SEMAPHORE
 
 

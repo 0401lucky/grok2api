@@ -43,7 +43,7 @@ class RetryContext:
     def should_retry(self, status_code: int) -> bool:
         """判断是否重试"""
         return (
-            self.attempt < self.max_retry and 
+            self.attempt <= self.max_retry and
             status_code in self.retry_codes
         )
     

@@ -28,19 +28,8 @@ BROWSER = "chrome136"
 TIMEOUT = 300
 DEFAULT_MAX_CONCURRENT = 50
 _MEDIA_SEMAPHORE = asyncio.Semaphore(DEFAULT_MAX_CONCURRENT)
-_MEDIA_SEM_VALUE = DEFAULT_MAX_CONCURRENT
 
 def _get_media_semaphore() -> asyncio.Semaphore:
-    global _MEDIA_SEMAPHORE, _MEDIA_SEM_VALUE
-    value = get_config("performance.media_max_concurrent", DEFAULT_MAX_CONCURRENT)
-    try:
-        value = int(value)
-    except Exception:
-        value = DEFAULT_MAX_CONCURRENT
-    value = max(1, value)
-    if value != _MEDIA_SEM_VALUE:
-        _MEDIA_SEM_VALUE = value
-        _MEDIA_SEMAPHORE = asyncio.Semaphore(value)
     return _MEDIA_SEMAPHORE
 
 

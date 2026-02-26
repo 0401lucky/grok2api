@@ -38,6 +38,9 @@ class RequestStats:
         
         self._lock = asyncio.Lock()
         self._loaded = False
+        self._dirty = False
+        self._save_task = None
+        self._save_delay = 1.0  # 合并保存延迟（秒）
         self._initialized = True
 
     async def init(self):
@@ -124,9 +127,30 @@ class RequestStats:
         
         # 定期清理旧数据
         self._cleanup()
-        
-        # 异步保存
-        asyncio.create_task(self._save_data())
+
+        # debounce 保存
+        self._schedule_save()
+
+    def _schedule_save(self):
+        """合并高频保存请求，减少写入开销"""
+        self._dirty = True
+        if self._save_task and not self._save_task.done():
+            return
+        self._save_task = asyncio.create_task(self._flush_loop())
+
+    async def _flush_loop(self):
+        """延迟合并写入循环"""
+        try:
+            while True:
+                await asyncio.sleep(self._save_delay)
+                if not self._dirty:
+                    break
+                self._dirty = False
+                await self._save_data()
+        finally:
+            self._save_task = None
+            if self._dirty:
+                self._schedule_save()
     
     def _cleanup(self) -> None:
         """清理过期数据"""

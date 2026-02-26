@@ -48,19 +48,8 @@ DEFAULT_MIME = "application/octet-stream"
 DEFAULT_MAX_CONCURRENT = 25
 DEFAULT_DELETE_BATCH_SIZE = 10
 _ASSETS_SEMAPHORE = asyncio.Semaphore(DEFAULT_MAX_CONCURRENT)
-_ASSETS_SEM_VALUE = DEFAULT_MAX_CONCURRENT
 
 def _get_assets_semaphore() -> asyncio.Semaphore:
-    global _ASSETS_SEMAPHORE, _ASSETS_SEM_VALUE
-    value = get_config("performance.assets_max_concurrent", DEFAULT_MAX_CONCURRENT)
-    try:
-        value = int(value)
-    except Exception:
-        value = DEFAULT_MAX_CONCURRENT
-    value = max(1, value)
-    if value != _ASSETS_SEM_VALUE:
-        _ASSETS_SEM_VALUE = value
-        _ASSETS_SEMAPHORE = asyncio.Semaphore(value)
     return _ASSETS_SEMAPHORE
 
 def _get_delete_batch_size() -> int:

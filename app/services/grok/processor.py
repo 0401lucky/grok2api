@@ -45,6 +45,8 @@ class BaseProcessor:
         self.token = token
         self.created = int(time.time())
         self.app_url = get_config("app.app_url", "")
+        self.response_id: Optional[str] = None
+        self.fingerprint: str = ""
         self._dl_service: Optional[DownloadService] = None
 
     def _get_dl(self) -> DownloadService:
@@ -84,11 +86,6 @@ class BaseProcessor:
             
     def _sse(self, content: str = "", role: str = None, finish: str = None) -> str:
         """构建 SSE 响应 (StreamProcessor 通用)"""
-        if not hasattr(self, 'response_id'):
-            self.response_id = None
-        if not hasattr(self, 'fingerprint'):
-            self.fingerprint = ""
-            
         delta = {}
         if role:
             delta["role"] = role
@@ -101,7 +98,7 @@ class BaseProcessor:
             "object": "chat.completion.chunk",
             "created": self.created,
             "model": self.model,
-            "system_fingerprint": self.fingerprint if hasattr(self, 'fingerprint') else "",
+            "system_fingerprint": self.fingerprint,
             "choices": [{"index": 0, "delta": delta, "logprobs": None, "finish_reason": finish}]
         }
         return f"data: {orjson.dumps(chunk).decode()}\n\n"
@@ -361,6 +358,7 @@ class VideoStreamProcessor(BaseProcessor):
             yield "data: [DONE]\n\n"
         except Exception as e:
             logger.error(f"Video stream processing error: {e}", extra={"model": self.model})
+            raise
         finally:
             await self.close()
 

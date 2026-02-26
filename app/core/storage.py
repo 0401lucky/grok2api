@@ -12,7 +12,6 @@
 import abc
 import os
 import asyncio
-import os
 import hashlib
 import time
 import tomllib
@@ -357,7 +356,7 @@ class RedisStorage(BaseStorage):
                     except: t_data["tags"] = []
                 
                 # 类型转换 (Redis 返回全 string)
-                for int_field in ["quota", "created_at", "use_count", "fail_count", "last_used_at", "last_fail_at", "last_sync_at"]:
+                for int_field in ["quota", "heavy_quota", "created_at", "use_count", "fail_count", "last_used_at", "last_fail_at", "last_sync_at", "last_asset_clear_at"]:
                     if t_data.get(int_field) and t_data[int_field] != "None":
                          try: t_data[int_field] = int(t_data[int_field])
                          except: pass
