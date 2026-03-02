@@ -18,9 +18,11 @@ image_generation_method = "legacy"
 app_url = "http://127.0.0.1:8000"
 admin_username = "admin"
 app_key = "admin"
+admin_session_ttl_hours = 8
 api_key = ""
 image_format = "url"
 video_format = "url"
+upload_max_image_mb = 25
 
 [token]
 auto_refresh = true

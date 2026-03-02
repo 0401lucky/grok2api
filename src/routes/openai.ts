@@ -89,11 +89,36 @@ async function runTasksSettledWithLimit<T, R>(
 
 export const openAiRoutes = new Hono<{ Bindings: Env; Variables: { apiAuth: ApiAuthInfo } }>();
 
+function parseCorsAllowList(raw: string | undefined): string[] {
+  const source = String(raw || "").trim();
+  if (!source) return ["http://127.0.0.1:8000", "http://localhost:8000"];
+  const items = source
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  return items.length ? items : ["http://127.0.0.1:8000", "http://localhost:8000"];
+}
+
+function resolveCorsOrigin(origin: string, allowList: string[]): string {
+  if (allowList.includes("*")) return "*";
+  const target = String(origin || "").trim().toLowerCase();
+  if (!target) return "";
+  for (const item of allowList) {
+    if (item.trim().toLowerCase() === target) return origin;
+  }
+  return "";
+}
+
 openAiRoutes.use(
   "/*",
   cors({
-    origin: "*",
-    allowHeaders: ["Authorization", "Content-Type"],
+    origin: (origin, c) => {
+      const allowList = parseCorsAllowList(c.env.CORS_ALLOW_ORIGINS);
+      const resolved = resolveCorsOrigin(origin || "", allowList);
+      return resolved ? resolved : null;
+    },
+    credentials: false,
+    allowHeaders: ["Authorization", "Content-Type", "Accept"],
     allowMethods: ["GET", "POST", "OPTIONS"],
     maxAge: 86400,
   }),

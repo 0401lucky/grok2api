@@ -16,16 +16,23 @@ BASE_DIR = Path(__file__).parent.parent.parent.parent / "data" / "tmp"
 IMAGE_DIR = BASE_DIR / "image"
 VIDEO_DIR = BASE_DIR / "video"
 
+def _safe_filename(raw: str) -> str:
+    name = str(raw or "").strip()
+    if not name:
+        raise HTTPException(status_code=404, detail="File not found")
+    # Disallow path traversal / separators (including Windows backslashes).
+    if "/" in name or "\\" in name or ".." in name:
+        raise HTTPException(status_code=400, detail="Invalid file name")
+    return name
+
 
 @router.get("/image/{filename:path}")
 async def get_image(filename: str):
     """
     获取图片文件
     """
-    if "/" in filename:
-        filename = filename.replace("/", "-")
-        
-    file_path = IMAGE_DIR / filename
+    safe = _safe_filename(filename)
+    file_path = IMAGE_DIR / safe
     
     if await aiofiles.os.path.exists(file_path):
         if await aiofiles.os.path.isfile(file_path):
@@ -44,7 +51,7 @@ async def get_image(filename: str):
                 }
             )
 
-    logger.warning(f"Image not found: {filename}")
+    logger.warning(f"Image not found: {safe}")
     raise HTTPException(status_code=404, detail="Image not found")
 
 
@@ -53,10 +60,8 @@ async def get_video(filename: str):
     """
     获取视频文件
     """
-    if "/" in filename:
-        filename = filename.replace("/", "-")
-        
-    file_path = VIDEO_DIR / filename
+    safe = _safe_filename(filename)
+    file_path = VIDEO_DIR / safe
     
     if await aiofiles.os.path.exists(file_path):
         if await aiofiles.os.path.isfile(file_path):
@@ -68,5 +73,5 @@ async def get_video(filename: str):
                 }
             )
 
-    logger.warning(f"Video not found: {filename}")
+    logger.warning(f"Video not found: {safe}")
     raise HTTPException(status_code=404, detail="Video not found")

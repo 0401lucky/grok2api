@@ -38,6 +38,9 @@ deleted_classes = ["AutoRegisterJob"]
 # Make sure the cron below matches this offset.
 CACHE_RESET_TZ_OFFSET_MINUTES = "480"
 
+# CORS allow-list (comma-separated). Use "*" only when you really need it.
+CORS_ALLOW_ORIGINS = "http://127.0.0.1:8000,http://localhost:8000"
+
 # Build info (CI will inject commit SHA into wrangler.ci.toml)
 BUILD_SHA = "dev"
 

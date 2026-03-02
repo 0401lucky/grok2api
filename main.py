@@ -9,6 +9,7 @@ import asyncio
 import os
 import platform
 import sys
+from typing import List
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -40,6 +41,33 @@ setup_logging(
     json_console=False,
     file_logging=True,
 )
+
+
+def _parse_cors_origins() -> List[str]:
+    """
+    解析 CORS 白名单。
+
+    通过环境变量 `CORS_ALLOW_ORIGINS` 配置，逗号分隔。
+    默认仅允许本机常见地址。
+    """
+    raw = str(
+        os.getenv(
+            "CORS_ALLOW_ORIGINS",
+            "http://127.0.0.1:8000,http://localhost:8000",
+        )
+        or ""
+    ).strip()
+    origins = [item.strip() for item in raw.split(",") if item.strip()]
+    return origins or ["http://127.0.0.1:8000", "http://localhost:8000"]
+
+
+def _parse_bool_env(name: str, default: bool = False) -> bool:
+    raw = str(os.getenv(name, str(default)) or "").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return bool(default)
 
 
 @asynccontextmanager
@@ -115,10 +143,10 @@ def create_app() -> FastAPI:
     # CORS 配置
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=_parse_cors_origins(),
+        allow_credentials=_parse_bool_env("CORS_ALLOW_CREDENTIALS", False),
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "Accept"],
     )
 
     # 请求日志和 ID 中间件

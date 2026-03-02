@@ -610,20 +610,42 @@ class SQLStorage(BaseStorage):
         from sqlalchemy import text
         try:
             async with self.async_session() as session:
+                incoming_rows = []
+                incoming_keys = set()
                 for section, items in data.items():
-                    if not isinstance(items, dict): continue
+                    if not isinstance(items, dict):
+                        continue
                     for key, val in items.items():
-                        val_str = json_dumps(val)
-                        
-                        # Upsert 逻辑 (简单实现: Delete + Insert)
-                        await session.execute(
-                            text("DELETE FROM app_config WHERE section=:s AND key_name=:k"),
-                            {"s": section, "k": key}
+                        row_key = (str(section), str(key))
+                        incoming_keys.add(row_key)
+                        incoming_rows.append(
+                            {
+                                "s": row_key[0],
+                                "k": row_key[1],
+                                "v": json_dumps(val),
+                            }
                         )
-                        await session.execute(
-                            text("INSERT INTO app_config (section, key_name, value) VALUES (:s, :k, :v)"),
-                            {"s": section, "k": key, "v": val_str}
-                        )
+
+                existing_rows = await session.execute(text("SELECT section, key_name FROM app_config"))
+                existing_keys = {(str(section), str(key)) for section, key in existing_rows.fetchall()}
+                stale_keys = existing_keys - incoming_keys
+
+                upsert_sql = (
+                    "INSERT INTO app_config (section, key_name, value) VALUES (:s, :k, :v) "
+                    "ON CONFLICT (section, key_name) DO UPDATE SET value = EXCLUDED.value"
+                    if self.dialect in ("postgres", "postgresql", "pgsql")
+                    else "INSERT INTO app_config (section, key_name, value) VALUES (:s, :k, :v) "
+                    "ON DUPLICATE KEY UPDATE value = VALUES(value)"
+                )
+
+                if incoming_rows:
+                    await session.execute(text(upsert_sql), incoming_rows)
+
+                for section, key in stale_keys:
+                    await session.execute(
+                        text("DELETE FROM app_config WHERE section=:s AND key_name=:k"),
+                        {"s": section, "k": key},
+                    )
                 await session.commit()
         except Exception as e:
             logger.error(f"SQLStorage: 保存配置失败: {e}")
@@ -660,24 +682,44 @@ class SQLStorage(BaseStorage):
         from sqlalchemy import text
         try:
             async with self.async_session() as session:
-                await session.execute(text("DELETE FROM tokens")) 
-                
                 params = []
+                incoming_token_ids = set()
                 for pool_name, tokens in data.items():
                     for t in tokens:
-                        params.append({
-                            "token": t.get("token"),
-                            "pool_name": pool_name,
-                            "data": json_dumps(t),
-                            "updated_at": 0
-                        })
-                
+                        token_id = str(t.get("token") or "").strip()
+                        if not token_id:
+                            continue
+                        incoming_token_ids.add(token_id)
+                        params.append(
+                            {
+                                "token": token_id,
+                                "pool_name": pool_name,
+                                "data": json_dumps(t),
+                                "updated_at": int(time.time() * 1000),
+                            }
+                        )
+
+                existing_rows = await session.execute(text("SELECT token FROM tokens"))
+                existing_ids = {str(row[0]) for row in existing_rows.fetchall() if row and row[0]}
+                stale_ids = existing_ids - incoming_token_ids
+
+                if stale_ids:
+                    for token_id in stale_ids:
+                        await session.execute(
+                            text("DELETE FROM tokens WHERE token=:token"),
+                            {"token": token_id},
+                        )
+
+                upsert_sql = (
+                    "INSERT INTO tokens (token, pool_name, data, updated_at) VALUES (:token, :pool_name, :data, :updated_at) "
+                    "ON CONFLICT (token) DO UPDATE SET pool_name = EXCLUDED.pool_name, data = EXCLUDED.data, updated_at = EXCLUDED.updated_at"
+                    if self.dialect in ("postgres", "postgresql", "pgsql")
+                    else "INSERT INTO tokens (token, pool_name, data, updated_at) VALUES (:token, :pool_name, :data, :updated_at) "
+                    "ON DUPLICATE KEY UPDATE pool_name = VALUES(pool_name), data = VALUES(data), updated_at = VALUES(updated_at)"
+                )
+
                 if params:
-                    # 批量插入
-                    await session.execute(
-                        text("INSERT INTO tokens (token, pool_name, data, updated_at) VALUES (:token, :pool_name, :data, :updated_at)"),
-                        params
-                    )
+                    await session.execute(text(upsert_sql), params)
                 await session.commit()
         except Exception as e:
             logger.error(f"SQLStorage: 保存 Token 失败: {e}")

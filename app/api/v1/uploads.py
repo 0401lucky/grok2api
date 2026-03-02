@@ -8,6 +8,7 @@ from pathlib import Path
 import aiofiles
 from fastapi import APIRouter, UploadFile, File, HTTPException
 
+from app.core.config import get_config
 from app.services.grok.assets import DownloadService
 
 
@@ -40,14 +41,39 @@ async def upload_image(file: UploadFile = File(...)):
     name = f"upload-{uuid.uuid4().hex}.{_ext_from_mime(content_type)}"
     path = IMAGE_DIR / name
 
+    try:
+        max_mb = int(get_config("app.upload_max_image_mb", 25) or 25)
+    except Exception:
+        max_mb = 25
+    max_mb = max(1, min(100, max_mb))
+    max_bytes = max_mb * 1024 * 1024
+
     size = 0
-    async with aiofiles.open(path, "wb") as f:
-        while True:
-            chunk = await file.read(1024 * 1024)
-            if not chunk:
-                break
-            size += len(chunk)
-            await f.write(chunk)
+    try:
+        async with aiofiles.open(path, "wb") as f:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > max_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Image file too large. Maximum is {max_mb}MB.",
+                    )
+                await f.write(chunk)
+    except Exception:
+        try:
+            if path.exists():
+                path.unlink()
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            await file.close()
+        except Exception:
+            pass
 
     # Best-effort: reuse existing cache cleanup policy (size-based).
     try:

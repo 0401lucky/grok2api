@@ -5,12 +5,17 @@
 import sys
 import json
 import traceback
+import threading
 from pathlib import Path
 from loguru import logger
 
 # 日志目录
 LOG_DIR = Path(__file__).parent.parent.parent / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+_file_lock = threading.Lock()
+_file_date: str | None = None
+_file_handle = None
 
 
 def _format_json(record) -> str:
@@ -61,11 +66,24 @@ def _make_json_sink(output):
 
 def _file_json_sink(message):
     """写入日志文件"""
+    global _file_date, _file_handle
     record = message.record
     json_str = _format_json(record)
-    log_file = LOG_DIR / f"app_{record['time'].strftime('%Y-%m-%d')}.log"
-    with open(log_file, "a", encoding="utf-8") as f:
-        f.write(json_str + "\n")
+    log_date = record["time"].strftime("%Y-%m-%d")
+    log_file = LOG_DIR / f"app_{log_date}.log"
+
+    with _file_lock:
+        if _file_handle is None or _file_date != log_date:
+            try:
+                if _file_handle is not None:
+                    _file_handle.close()
+            except Exception:
+                pass
+            _file_handle = open(log_file, "a", encoding="utf-8")
+            _file_date = log_date
+
+        _file_handle.write(json_str + "\n")
+        _file_handle.flush()
 
 
 def setup_logging(

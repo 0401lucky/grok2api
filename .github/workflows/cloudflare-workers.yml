@@ -31,7 +31,16 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.13"
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install Python dependencies
+        run: uv sync --frozen --no-dev
+
+      - name: Run Python tests
+        run: uv run --frozen --with pytest pytest -q
 
       - name: Verify model catalog consistency
         run: python scripts/check_model_catalog_sync.py
@@ -47,7 +56,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.13"
 
       - name: Setup Node
         uses: actions/setup-node@v4

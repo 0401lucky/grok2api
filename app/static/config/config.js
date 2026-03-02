@@ -18,6 +18,8 @@ const NUMERIC_FIELDS = new Set([
   'nsfw_max_concurrent',
   'nsfw_batch_size',
   'reload_interval_sec',
+  'admin_session_ttl_hours',
+  'upload_max_image_mb',
   'solver_threads',
   'register_threads',
   'default_count'
@@ -29,9 +31,11 @@ const LOCALE_MAP = {
     "api_key": { title: "API 密钥", desc: "调用 Grok2API 服务所需的 Bearer Token，请妥善保管。" },
     "admin_username": { title: "后台账号", desc: "登录 Grok2API 服务管理后台的用户名，默认 admin。" },
     "app_key": { title: "后台密码", desc: "登录 Grok2API 服务管理后台的密码，请妥善保管。" },
+    "admin_session_ttl_hours": { title: "会话时长", desc: "后台会话 token 的有效时长（小时，1-72）。" },
     "app_url": { title: "应用地址", desc: "当前 Grok2API 服务的外部访问 URL，用于文件链接访问。" },
     "image_format": { title: "图片格式", desc: "生成的图片格式（url / base64 / b64_json）。" },
-    "video_format": { title: "视频格式", desc: "生成的视频格式（仅支持 url）。" }
+    "video_format": { title: "视频格式", desc: "生成的视频格式（仅支持 url）。" },
+    "upload_max_image_mb": { title: "上传大小上限", desc: "前端上传图片接口的单文件大小上限（MB）。" }
   },
   "grok": {
     "label": "Grok 设置",
@@ -289,7 +293,7 @@ function renderConfig(data) {
         input.dataset.section = section;
         input.dataset.key = key;
 
-        if (key === 'app_key') input.type = 'text';
+        if (key === 'app_key') input.type = 'password';
 
         if (key === 'api_key' || key === 'app_key') {
           const wrapper = document.createElement('div');

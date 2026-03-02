@@ -10,6 +10,10 @@ export interface Env {
   // Build info (injected by CI)
   BUILD_SHA?: string;
 
+  // CORS allow-list, comma separated. Example:
+  // http://127.0.0.1:8000,http://localhost:8000
+  CORS_ALLOW_ORIGINS?: string;
+
   // Max object size to store into KV (Workers KV has per-value limits; default 25MB)
   KV_CACHE_MAX_BYTES?: string;
 

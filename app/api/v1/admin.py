@@ -3,9 +3,13 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 from typing import Any, Optional
 
-from app.core.auth import verify_api_key
 from app.core.config import config, get_config
 from app.core.storage import get_storage, LocalStorage, RedisStorage, SQLStorage
+from app.core.admin_session import (
+    create_admin_session_token,
+    verify_admin_session,
+    verify_admin_session_token,
+)
 import os
 from pathlib import Path
 import aiofiles
@@ -102,13 +106,17 @@ async def admin_chat_page():
 
 
 async def _verify_ws_api_key(websocket: WebSocket) -> bool:
-    api_key = str(get_config("app.api_key", "") or "").strip()
-    legacy_keys = await _load_legacy_api_keys()
-    if not api_key and not legacy_keys:
-        return True
     token = str(websocket.query_params.get("api_key") or "").strip()
     if not token:
         return False
+
+    # 首选后台会话 token（登录接口返回）。
+    if verify_admin_session_token(token):
+        return True
+
+    # 向后兼容：允许使用全局 API key / legacy key / 托管 key。
+    api_key = str(get_config("app.api_key", "") or "").strip()
+    legacy_keys = await _load_legacy_api_keys()
     if (api_key and token == api_key) or token in legacy_keys:
         return True
     try:
@@ -326,12 +334,13 @@ async def admin_imagine_ws(websocket: WebSocket):
 async def admin_login_api(request: Request, body: AdminLoginBody | None = Body(default=None)):
     """管理后台登录验证（用户名+密码）
 
+    - 登录成功后返回短期后台会话 token（用于 `/api/v1/admin/*` 鉴权）
     - 默认账号/密码：admin/admin（可在配置管理的「应用设置」里修改）
     - 兼容旧版本：允许 Authorization: Bearer <password> 仅密码登录（用户名默认为 admin）
     """
 
     admin_username = str(get_config("app.admin_username", "admin") or "admin").strip() or "admin"
-    admin_password = str(get_config("app.app_key", "admin") or "admin").strip()
+    admin_password = str(get_config("app.app_key", "") or "").strip()
 
     username = (body.username.strip() if body and isinstance(body.username, str) else "").strip()
     password = (body.password.strip() if body and isinstance(body.password, str) else "").strip()
@@ -347,18 +356,29 @@ async def admin_login_api(request: Request, body: AdminLoginBody | None = Body(d
     if not username or not password:
         raise HTTPException(status_code=400, detail="Missing username or password")
 
+    if not admin_password:
+        raise HTTPException(status_code=503, detail="Admin password is not configured")
+
     if username != admin_username or password != admin_password:
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
-    return {"status": "success", "api_key": get_config("app.api_key", "")}
+    session_ttl_hours = 8
+    try:
+        session_ttl_hours = int(get_config("app.admin_session_ttl_hours", 8) or 8)
+    except Exception:
+        session_ttl_hours = 8
+    session_ttl_hours = max(1, min(72, session_ttl_hours))
+    session_token = create_admin_session_token(admin_username, ttl_hours=session_ttl_hours)
+    # 为兼容现有前端结构，仍沿用字段名 api_key，值改为后台会话 token。
+    return {"status": "success", "api_key": session_token}
 
-@router.get("/api/v1/admin/config", dependencies=[Depends(verify_api_key)])
+@router.get("/api/v1/admin/config", dependencies=[Depends(verify_admin_session)])
 async def get_config_api():
     """获取当前配置"""
     # 暴露原始配置字典
     return config._config
 
-@router.post("/api/v1/admin/config", dependencies=[Depends(verify_api_key)])
+@router.post("/api/v1/admin/config", dependencies=[Depends(verify_admin_session)])
 async def update_config_api(data: dict):
     """更新配置"""
     try:
@@ -557,7 +577,7 @@ def _trigger_account_settings_refresh_background(
     asyncio.create_task(_run())
 
 
-@router.get("/api/v1/admin/keys", dependencies=[Depends(verify_api_key)])
+@router.get("/api/v1/admin/keys", dependencies=[Depends(verify_admin_session)])
 async def list_api_keys():
     """List API keys + daily usage/remaining (for admin UI)."""
     await api_key_manager.init()
@@ -602,7 +622,7 @@ async def list_api_keys():
     return {"success": True, "data": out}
 
 
-@router.post("/api/v1/admin/keys", dependencies=[Depends(verify_api_key)])
+@router.post("/api/v1/admin/keys", dependencies=[Depends(verify_admin_session)])
 async def create_api_key(data: dict):
     """Create a new API key (optional name/key/limits)."""
     await api_key_manager.init()
@@ -631,7 +651,7 @@ async def create_api_key(data: dict):
     return {"success": True, "data": {**row, "display_key": _display_key(row.get("key", ""))}}
 
 
-@router.post("/api/v1/admin/keys/update", dependencies=[Depends(verify_api_key)])
+@router.post("/api/v1/admin/keys/update", dependencies=[Depends(verify_admin_session)])
 async def update_api_key(data: dict):
     """Update name/status/limits for an API key."""
     await api_key_manager.init()
@@ -667,7 +687,7 @@ async def update_api_key(data: dict):
     return {"success": True}
 
 
-@router.post("/api/v1/admin/keys/delete", dependencies=[Depends(verify_api_key)])
+@router.post("/api/v1/admin/keys/delete", dependencies=[Depends(verify_admin_session)])
 async def delete_api_key(data: dict):
     """Delete an API key."""
     await api_key_manager.init()
@@ -681,7 +701,7 @@ async def delete_api_key(data: dict):
         raise HTTPException(status_code=404, detail="Key not found")
     return {"success": True}
 
-@router.get("/api/v1/admin/storage", dependencies=[Depends(verify_api_key)])
+@router.get("/api/v1/admin/storage", dependencies=[Depends(verify_admin_session)])
 async def get_storage_info():
     """获取当前存储模式"""
     storage_type = os.getenv("SERVER_STORAGE_TYPE", "local").lower()
@@ -703,7 +723,7 @@ async def get_storage_info():
                 storage_type = storage.dialect
     return {"type": storage_type or "local"}
 
-@router.get("/api/v1/admin/tokens", dependencies=[Depends(verify_api_key)])
+@router.get("/api/v1/admin/tokens", dependencies=[Depends(verify_admin_session)])
 async def get_tokens_api():
     """获取所有 Token"""
     storage = get_storage()
@@ -720,7 +740,7 @@ async def get_tokens_api():
         out[str(pool_name)] = normalized
     return out
 
-@router.post("/api/v1/admin/tokens", dependencies=[Depends(verify_api_key)])
+@router.post("/api/v1/admin/tokens", dependencies=[Depends(verify_admin_session)])
 async def update_tokens_api(data: dict):
     """Update token payload and trigger background account-settings refresh for new tokens."""
     storage = get_storage()
@@ -766,7 +786,7 @@ async def update_tokens_api(data: dict):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/api/v1/admin/tokens/refresh", dependencies=[Depends(verify_api_key)])
+@router.post("/api/v1/admin/tokens/refresh", dependencies=[Depends(verify_admin_session)])
 async def refresh_tokens_api(data: dict):
     """刷新 Token 状态"""
     from app.services.token.manager import get_token_manager
@@ -797,7 +817,7 @@ async def refresh_tokens_api(data: dict):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/api/v1/admin/tokens/nsfw/enable", dependencies=[Depends(verify_api_key)])
+@router.post("/api/v1/admin/tokens/nsfw/enable", dependencies=[Depends(verify_admin_session)])
 async def enable_tokens_nsfw_api(data: dict):
     """批量开启 NSFW（仅开启开关并打 tag，不做协议/生日/失效处理）。"""
     payload = data if isinstance(data, dict) else {}
@@ -937,7 +957,7 @@ async def enable_tokens_nsfw_api(data: dict):
     return response
 
 
-@router.post("/api/v1/admin/tokens/nsfw/refresh", dependencies=[Depends(verify_api_key)])
+@router.post("/api/v1/admin/tokens/nsfw/refresh", dependencies=[Depends(verify_admin_session)])
 async def refresh_tokens_nsfw_api(data: dict):
     """Refresh account settings (TOS + birth date + NSFW) for selected/all tokens."""
     payload = data if isinstance(data, dict) else {}
@@ -995,7 +1015,7 @@ async def refresh_tokens_nsfw_api(data: dict):
     }
 
 
-@router.post("/api/v1/admin/tokens/failures/clear", dependencies=[Depends(verify_api_key)])
+@router.post("/api/v1/admin/tokens/failures/clear", dependencies=[Depends(verify_admin_session)])
 async def clear_token_failures_api(data: dict):
     """Clear token failure state / restore expired tokens (admin helper)."""
     payload = data if isinstance(data, dict) else {}
@@ -1079,7 +1099,7 @@ async def clear_token_failures_api(data: dict):
     }
 
 
-@router.post("/api/v1/admin/tokens/auto-register", dependencies=[Depends(verify_api_key)])
+@router.post("/api/v1/admin/tokens/auto-register", dependencies=[Depends(verify_admin_session)])
 async def auto_register_tokens_api(data: dict):
     """Start auto registration."""
     try:
@@ -1112,7 +1132,7 @@ async def auto_register_tokens_api(data: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/api/v1/admin/tokens/auto-register/status", dependencies=[Depends(verify_api_key)])
+@router.get("/api/v1/admin/tokens/auto-register/status", dependencies=[Depends(verify_admin_session)])
 async def auto_register_status_api(job_id: str | None = None):
     """Get auto registration status."""
     manager = get_auto_register_manager()
@@ -1122,7 +1142,7 @@ async def auto_register_status_api(job_id: str | None = None):
     return status
 
 
-@router.post("/api/v1/admin/tokens/auto-register/stop", dependencies=[Depends(verify_api_key)])
+@router.post("/api/v1/admin/tokens/auto-register/stop", dependencies=[Depends(verify_admin_session)])
 async def auto_register_stop_api(job_id: str | None = None):
     """Stop auto registration (best-effort)."""
     manager = get_auto_register_manager()
@@ -1137,7 +1157,7 @@ async def admin_cache_page():
     """缓存管理页"""
     return await render_template("cache/cache.html")
 
-@router.get("/api/v1/admin/cache", dependencies=[Depends(verify_api_key)])
+@router.get("/api/v1/admin/cache", dependencies=[Depends(verify_admin_session)])
 async def get_cache_stats_api(request: Request):
     """获取缓存统计"""
     from app.services.grok.assets import DownloadService, ListService
@@ -1263,7 +1283,7 @@ async def get_cache_stats_api(request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/api/v1/admin/cache/clear", dependencies=[Depends(verify_api_key)])
+@router.post("/api/v1/admin/cache/clear", dependencies=[Depends(verify_admin_session)])
 async def clear_local_cache_api(data: dict):
     """清理本地缓存"""
     from app.services.grok.assets import DownloadService
@@ -1276,7 +1296,7 @@ async def clear_local_cache_api(data: dict):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/api/v1/admin/cache/list", dependencies=[Depends(verify_api_key)])
+@router.get("/api/v1/admin/cache/list", dependencies=[Depends(verify_admin_session)])
 async def list_local_cache_api(
     cache_type: str = "image",
     type_: str = Query(default=None, alias="type"),
@@ -1294,7 +1314,7 @@ async def list_local_cache_api(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/api/v1/admin/cache/item/delete", dependencies=[Depends(verify_api_key)])
+@router.post("/api/v1/admin/cache/item/delete", dependencies=[Depends(verify_admin_session)])
 async def delete_local_cache_item_api(data: dict):
     """删除单个本地缓存文件"""
     from app.services.grok.assets import DownloadService
@@ -1309,7 +1329,7 @@ async def delete_local_cache_item_api(data: dict):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/api/v1/admin/cache/online/clear", dependencies=[Depends(verify_api_key)])
+@router.post("/api/v1/admin/cache/online/clear", dependencies=[Depends(verify_admin_session)])
 async def clear_online_cache_api(data: dict):
     """清理在线缓存"""
     from app.services.grok.assets import DeleteService
@@ -1364,7 +1384,7 @@ async def clear_online_cache_api(data: dict):
             await delete_service.close()
 
 
-@router.get("/api/v1/admin/metrics", dependencies=[Depends(verify_api_key)])
+@router.get("/api/v1/admin/metrics", dependencies=[Depends(verify_admin_session)])
 async def get_metrics_api():
     """数据中心：聚合常用指标（token/cache/request_stats）。"""
     try:
@@ -1426,7 +1446,7 @@ async def get_metrics_api():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/api/v1/admin/cache/local", dependencies=[Depends(verify_api_key)])
+@router.get("/api/v1/admin/cache/local", dependencies=[Depends(verify_admin_session)])
 async def get_cache_local_stats_api():
     """仅获取本地缓存统计（用于前端实时刷新）。"""
     from app.services.grok.assets import DownloadService
@@ -1508,7 +1528,7 @@ def _tail_lines(path: Path, max_lines: int = 2000, max_bytes: int = 1024 * 1024)
     return [_format_log_line(ln) for ln in lines if ln is not None]
 
 
-@router.get("/api/v1/admin/logs/files", dependencies=[Depends(verify_api_key)])
+@router.get("/api/v1/admin/logs/files", dependencies=[Depends(verify_admin_session)])
 async def list_log_files_api():
     """列出可查看的日志文件（logs/*.log）。"""
     from app.core.logger import LOG_DIR
@@ -1533,7 +1553,7 @@ async def list_log_files_api():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/api/v1/admin/logs/tail", dependencies=[Depends(verify_api_key)])
+@router.get("/api/v1/admin/logs/tail", dependencies=[Depends(verify_admin_session)])
 async def tail_log_api(file: str | None = None, lines: int = 500):
     """读取后台日志（尾部）。"""
     from app.core.logger import LOG_DIR
@@ -1557,3 +1577,4 @@ async def tail_log_api(file: str | None = None, lines: int = 500):
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+

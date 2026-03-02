@@ -20,12 +20,14 @@ async function login() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username, password })
     });
+    const data = await res.json().catch(() => ({}));
 
-    if (res.ok) {
-      await storeAppKey({ username, password });
+    if (res.ok && data && data.api_key) {
+      await storeAppKey(data.api_key);
       window.location.href = '/admin/token';
     } else {
-      showToast('用户名或密码错误', 'error');
+      const message = (data && (data.detail || data.error)) ? String(data.detail || data.error) : '用户名或密码错误';
+      showToast(message, 'error');
     }
   } catch (e) {
     showToast('连接失败', 'error');
@@ -34,20 +36,18 @@ async function login() {
 
 // Auto-redirect checks
 (async () => {
-  const existing = await getStoredAppKey();
-  const existingUsername = (existing && existing.username) ? String(existing.username) : '';
-  const existingPassword = (existing && existing.password) ? String(existing.password) : '';
-
-  usernameInput.value = existingUsername || 'admin';
+  const existingToken = await getStoredAppKey();
+  usernameInput.value = 'admin';
   passwordInput.focus();
 
-  if (!existingPassword) return;
+  if (!existingToken) return;
 
-  fetch('/api/v1/admin/login', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username: usernameInput.value.trim(), password: existingPassword })
-  }).then(res => {
-    if (res.ok) window.location.href = '/admin/token';
-  });
+  const res = await fetch('/api/v1/admin/storage', {
+    headers: buildAuthHeaders(`Bearer ${existingToken}`)
+  }).catch(() => null);
+  if (res && res.ok) {
+    window.location.href = '/admin/token';
+    return;
+  }
+  clearStoredAppKey();
 })();
