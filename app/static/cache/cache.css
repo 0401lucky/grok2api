@@ -71,6 +71,14 @@
   border-radius: 6px;
   object-fit: cover;
   border: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.cache-filename {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
 }
 
 #confirm-dialog.confirm-dialog {
@@ -177,6 +185,7 @@
   border-collapse: separate;
   border-spacing: 0;
   font-size: 13px;
+  table-layout: fixed;
 }
 
 .geist-table th {

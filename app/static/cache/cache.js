@@ -815,9 +815,9 @@ function renderLocalCacheList(type, items) {
           <input type="checkbox" class="checkbox" data-name="${item.name}" ${checked} onchange="toggleLocalSelect('${type}', '${item.name}', this)">
         </td>
         <td class="text-left">
-          <div class="flex items-center gap-2">
+          <div class="flex items-center gap-2" style="min-width:0">
             ${preview}
-            <span class="font-mono text-xs text-gray-500">${item.name}</span>
+            <span class="font-mono text-xs text-gray-500 cache-filename" title="${item.name}">${item.name}</span>
           </div>
         </td>
         <td class="text-left">${formatSize(item.size_bytes)}</td>
@@ -847,7 +847,7 @@ function renderLocalCacheList(type, items) {
 
 function viewLocalFile(type, name) {
   const safeName = encodeURIComponent(name);
-  const url = type === 'image' ? `/v1/files/image/${safeName}` : `/v1/files/video/${safeName}`;
+  const url = `/images/${safeName}`;
   window.open(url, '_blank');
 }
 

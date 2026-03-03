@@ -10,7 +10,7 @@
   <link href="https://cdn.jsdelivr.net/npm/geist@1.0.0/dist/fonts/geist-sans/style.css" rel="stylesheet">
   <link href="https://cdn.jsdelivr.net/npm/geist@1.0.0/dist/fonts/geist-mono/style.css" rel="stylesheet">
   <link href="/static/common/common.css?v=3" rel="stylesheet">
-  <link href="/static/cache/cache.css?v=4" rel="stylesheet">
+  <link href="/static/cache/cache.css?v=5" rel="stylesheet">
   <link href="/static/common/toast.css" rel="stylesheet">
 </head>
 
@@ -88,17 +88,17 @@
 
       <div id="local-cache-lists" class="space-y-4 hidden">
         <div id="local-image-list" class="cache-list hidden">
-          <div class="rounded-lg overflow-hidden bg-white overflow-x-auto">
-            <table class="geist-table min-w-[600px]">
+          <div class="rounded-lg overflow-hidden bg-white">
+            <table class="geist-table">
               <thead>
                 <tr>
-                  <th class="w-10 text-center">
+                  <th style="width:40px" class="text-center">
                     <input id="local-image-select-all" type="checkbox" class="checkbox" onchange="toggleLocalSelectAll('image', this)">
                   </th>
-                  <th class="w-108 text-left">文件</th>
-                  <th class="w-32 text-left">大小</th>
-                  <th class="w-48 text-left">时间</th>
-                  <th class="w-24 text-center">操作</th>
+                  <th class="text-left">文件</th>
+                  <th style="width:80px" class="text-left">大小</th>
+                  <th style="width:140px" class="text-left">时间</th>
+                  <th style="width:72px" class="text-center">操作</th>
                 </tr>
               </thead>
               <tbody id="local-image-body"></tbody>
@@ -106,17 +106,17 @@
           </div>
         </div>
         <div id="local-video-list" class="cache-list hidden">
-          <div class="rounded-lg overflow-hidden bg-white overflow-x-auto">
-            <table class="geist-table min-w-[600px]">
+          <div class="rounded-lg overflow-hidden bg-white">
+            <table class="geist-table">
               <thead>
                 <tr>
-                  <th class="w-10 text-center">
+                  <th style="width:40px" class="text-center">
                     <input id="local-video-select-all" type="checkbox" class="checkbox" onchange="toggleLocalSelectAll('video', this)">
                   </th>
-                  <th class="w-108 text-left">文件</th>
-                  <th class="w-32 text-left">大小</th>
-                  <th class="w-48 text-left">时间</th>
-                  <th class="w-24 text-center">操作</th>
+                  <th class="text-left">文件</th>
+                  <th style="width:80px" class="text-left">大小</th>
+                  <th style="width:140px" class="text-left">时间</th>
+                  <th style="width:72px" class="text-center">操作</th>
                 </tr>
               </thead>
               <tbody id="local-video-body"></tbody>
@@ -200,7 +200,7 @@
   <script src="/static/common/header.js?v=4"></script>
   <script src="/static/common/footer.js?v=1"></script>
   <script src="/static/common/toast.js"></script>
-  <script src="/static/cache/cache.js?v=5"></script>
+  <script src="/static/cache/cache.js?v=6"></script>
   <script src="/static/common/draggable.js"></script>
 </body>
 
