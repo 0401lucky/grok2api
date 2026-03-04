@@ -218,14 +218,30 @@ class AccountSettingsRefreshService:
 
         results = await asyncio.gather(*[_run_one(token) for token in unique_tokens])
 
+        commit_error: str | None = None
         try:
             await self.token_manager.commit()
         except Exception as exc:
-            logger.warning("Account settings refresh commit failed: {}", exc)
+            commit_error = str(exc)
+            logger.error("Account settings refresh commit failed: {}", exc)
 
         success = sum(1 for item in results if item.get("ok"))
         failed_items = [item for item in results if not item.get("ok")]
         invalidated = sum(1 for item in failed_items if item.get("invalidated"))
+
+        if commit_error:
+            failed_items.extend(
+                {
+                    "token": item.get("token"),
+                    "ok": False,
+                    "step": "commit",
+                    "error": f"commit_failed: {commit_error}",
+                    "invalidated": False,
+                }
+                for item in results
+                if item.get("ok")
+            )
+            success = 0
 
         summary = {
             "total": len(unique_tokens),
@@ -233,6 +249,9 @@ class AccountSettingsRefreshService:
             "failed": len(failed_items),
             "invalidated": invalidated,
         }
+        if commit_error:
+            summary["persisted"] = False
+            summary["commit_error"] = commit_error
 
         return {"summary": summary, "failed": failed_items}
 

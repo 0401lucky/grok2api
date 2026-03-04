@@ -48,6 +48,8 @@ DEFAULT_MIME = "application/octet-stream"
 DEFAULT_MAX_CONCURRENT = 25
 DEFAULT_DELETE_BATCH_SIZE = 10
 _ASSETS_SEMAPHORE = asyncio.Semaphore(DEFAULT_MAX_CONCURRENT)
+_LOCAL_LOCKS: dict[str, asyncio.Lock] = {}
+_LOCAL_LOCKS_GUARD = asyncio.Lock()
 
 def _get_assets_semaphore() -> asyncio.Semaphore:
     return _ASSETS_SEMAPHORE
@@ -63,7 +65,22 @@ def _get_delete_batch_size() -> int:
 @asynccontextmanager
 async def _file_lock(name: str, timeout: int = 10):
     if fcntl is None:
-        yield
+        async with _LOCAL_LOCKS_GUARD:
+            local_lock = _LOCAL_LOCKS.get(name)
+            if local_lock is None:
+                local_lock = asyncio.Lock()
+                _LOCAL_LOCKS[name] = local_lock
+        try:
+            await asyncio.wait_for(local_lock.acquire(), timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(f"acquire local lock timeout: {name}") from exc
+        try:
+            yield
+        finally:
+            try:
+                local_lock.release()
+            except Exception:
+                pass
         return
     LOCK_DIR.mkdir(parents=True, exist_ok=True)
     lock_path = LOCK_DIR / f"{name}.lock"
@@ -79,7 +96,7 @@ async def _file_lock(name: str, timeout: int = 10):
                 break
             except BlockingIOError:
                 if time.monotonic() - start >= timeout:
-                    break
+                    raise TimeoutError(f"acquire file lock timeout: {name}")
                 await asyncio.sleep(0.05)
         yield
     finally:
@@ -539,18 +556,61 @@ class DownloadService(BaseService):
         self.image_dir.mkdir(parents=True, exist_ok=True)
         self.video_dir.mkdir(parents=True, exist_ok=True)
         self._cleanup_running = False
+        self._cleanup_task: Optional[asyncio.Task] = None
+
+    @staticmethod
+    def _safe_cache_filename(file_path: str) -> str:
+        raw = str(file_path or "").strip()
+        if not raw:
+            raise ValidationException(message="Invalid file path", code="invalid_file_path")
+        normalized = raw.replace("\\", "/")
+        if normalized.startswith("http://") or normalized.startswith("https://"):
+            try:
+                normalized = urlparse(normalized).path or "/"
+            except Exception:
+                pass
+        normalized = normalized.strip() or "/"
+        base = Path(normalized).name or "asset"
+        base = re.sub(r"[^A-Za-z0-9._-]", "_", base)
+        base = base[:120] if len(base) > 120 else base
+        digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:16]
+        return f"{digest}-{base}"
+
+    @staticmethod
+    def _safe_join_cache_dir(cache_dir: Path, filename: str) -> Path:
+        path = (cache_dir / filename).resolve()
+        cache_root = cache_dir.resolve()
+        try:
+            path.relative_to(cache_root)
+        except Exception as exc:
+            raise ValidationException(message="Invalid cache path", code="invalid_cache_path") from exc
+        return path
     
     def _cache_path(self, file_path: str, media_type: str) -> Path:
         """获取缓存路径"""
         cache_dir = self.image_dir if media_type == "image" else self.video_dir
-        filename = file_path.lstrip('/').replace('/', '-')
-        return cache_dir / filename
+        filename = self._safe_cache_filename(file_path)
+        return self._safe_join_cache_dir(cache_dir, filename)
 
     def _legacy_cache_path(self, file_path: str, media_type: str) -> Path:
         """Legacy cache path (data/temp)."""
         cache_dir = self.legacy_image_dir if media_type == "image" else self.legacy_video_dir
-        filename = file_path.lstrip("/").replace("/", "-")
-        return cache_dir / filename
+        filename = self._safe_cache_filename(file_path)
+        return self._safe_join_cache_dir(cache_dir, filename)
+
+    def _schedule_check_limit(self) -> None:
+        if self._cleanup_task and not self._cleanup_task.done():
+            return
+
+        async def _runner():
+            try:
+                await self.check_limit()
+            except Exception as exc:
+                logger.warning(f"Cache cleanup background task failed: {exc}")
+            finally:
+                self._cleanup_task = None
+
+        self._cleanup_task = asyncio.create_task(_runner())
     
     async def download(self, file_path: str, token: str, media_type: str = "image") -> Tuple[Optional[Path], str]:
         """
@@ -644,7 +704,7 @@ class DownloadService(BaseService):
                     logger.info(f"Download success: {file_path}")
                     
                     # 检查缓存限制
-                    asyncio.create_task(self.check_limit())
+                    self._schedule_check_limit()
                     
                     return cache_path, mime_type
             
@@ -749,8 +809,13 @@ class DownloadService(BaseService):
     def delete_file(self, media_type: str, name: str) -> Dict[str, Any]:
         """删除单个缓存文件"""
         cache_dir = self.image_dir if media_type == "image" else self.video_dir
-        safe_name = name.replace("/", "-")
-        file_path = cache_dir / safe_name
+        safe_name = str(name or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}", safe_name):
+            return {"deleted": False}
+        try:
+            file_path = self._safe_join_cache_dir(cache_dir, safe_name)
+        except Exception:
+            return {"deleted": False}
         if not file_path.exists():
             return {"deleted": False}
         try:

@@ -7,7 +7,7 @@ from typing import Dict, List, Optional
 
 from app.core.logger import logger
 from app.services.token.models import TokenInfo, EffortType, TokenPoolStats, FAIL_THRESHOLD, TokenStatus
-from app.core.storage import get_storage
+from app.core.storage import get_storage, LocalStorage
 from app.core.config import get_config
 from app.services.token.pool import TokenPool
 
@@ -48,12 +48,17 @@ class TokenManager:
             try:
                 storage = get_storage()
                 data = await storage.load_tokens()
+                if data is None:
+                    raise RuntimeError(f"Token storage load failed ({storage.__class__.__name__})")
+                if not isinstance(data, dict):
+                    raise RuntimeError(f"Token storage returned invalid payload ({type(data).__name__})")
                 
                 # 如果后端返回 None 或空数据，尝试从本地 data/token.json 初始化后端
-                if not data:
-                    from app.core.storage import LocalStorage
+                if not data and not isinstance(storage, LocalStorage):
                     local_storage = LocalStorage()
                     local_data = await local_storage.load_tokens()
+                    if local_data is None:
+                        raise RuntimeError("Local token bootstrap load failed")
                     if local_data:
                         data = local_data
                         await storage.save_tokens(local_data)
@@ -110,18 +115,19 @@ class TokenManager:
     async def _save(self):
         """保存变更"""
         async with self._save_lock:
+            data = {}
+            for pool_name, pool in self.pools.items():
+                data[pool_name] = [
+                    info.model_dump() for info in pool.list()
+                ]
+            
+            storage = get_storage()
             try:
-                data = {}
-                for pool_name, pool in self.pools.items():
-                    data[pool_name] = [
-                        info.model_dump() for info in pool.list()
-                    ]
-                
-                storage = get_storage()
                 async with storage.acquire_lock("tokens_save", timeout=10):
                     await storage.save_tokens(data)
             except Exception as e:
                 logger.error(f"Failed to save tokens: {e}")
+                raise
 
     def _schedule_save(self):
         """合并高频保存请求，减少写入开销"""
@@ -148,7 +154,12 @@ class TokenManager:
                 if not self._dirty:
                     break
                 self._dirty = False
-                await self._save()
+                try:
+                    await self._save()
+                except Exception as e:
+                    logger.error(f"Deferred token save failed, will retry: {e}")
+                    self._dirty = True
+                    await asyncio.sleep(max(0.1, self._save_delay))
         finally:
             self._save_task = None
             if self._dirty:

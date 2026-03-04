@@ -5,47 +5,22 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 from app.core.logger import logger
-from app.core.storage import get_storage, StorageError, RedisStorage
+from app.core.storage import get_storage, StorageError
 from app.services.token.manager import get_token_manager
 
 
 @asynccontextmanager
 async def _acquire_refresh_lock(storage, interval_seconds: int):
-    """统一获取刷新锁（Redis / Local）并在退出时释放。"""
-    lock = None
-    acquired = False
-
-    if isinstance(storage, RedisStorage):
-        lock_key = "grok2api:lock:token_refresh"
-        lock = storage.redis.lock(lock_key, timeout=interval_seconds + 60, blocking_timeout=0)
-        acquired = await lock.acquire(blocking=False)
-    else:
-        # LocalStorage: 用 asyncio.Lock 模拟 try-lock
-        local_lock = getattr(storage, "_refresh_lock", None)
-        if local_lock is None:
-            local_lock = asyncio.Lock()
-            storage._refresh_lock = local_lock
-        acquired = local_lock.locked() is False
-        if acquired:
-            await local_lock.acquire()
-
-    if not acquired:
-        yield False
-        return
-
+    """统一使用 storage.acquire_lock 获取分布式/本地锁。"""
+    try_timeout = max(1, min(30, int(interval_seconds // 120)))
     try:
-        yield True
-    finally:
-        if lock is not None:
-            try:
-                await lock.release()
-            except Exception:
-                pass
-        elif acquired and hasattr(storage, "_refresh_lock"):
-            try:
-                storage._refresh_lock.release()
-            except Exception:
-                pass
+        async with storage.acquire_lock("token_refresh", timeout=try_timeout):
+            yield True
+    except StorageError:
+        yield False
+    except Exception as e:
+        logger.warning(f"Scheduler: lock acquire error - {e}")
+        yield False
 
 
 class TokenRefreshScheduler:

@@ -15,6 +15,7 @@ import asyncio
 import hashlib
 import time
 import tomllib
+import uuid
 from typing import Any, Dict, Optional
 from pathlib import Path
 from enum import Enum
@@ -197,13 +198,13 @@ class LocalStorage(BaseStorage):
                 return json_loads(content)
         except Exception as e:
             logger.error(f"LocalStorage: 加载 Token 失败: {e}")
-            return {}
+            return None
 
     async def save_tokens(self, data: Dict[str, Any]):
         try:
             TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-            temp_path = TOKEN_FILE.with_suffix('.tmp')
-            
+            temp_path = TOKEN_FILE.with_name(f"{TOKEN_FILE.name}.{uuid.uuid4().hex}.tmp")
+             
             # 原子写操作: 写入临时文件 -> 重命名
             async with aiofiles.open(temp_path, "wb") as f:
                 await f.write(orjson.dumps(data, option=orjson.OPT_INDENT_2))

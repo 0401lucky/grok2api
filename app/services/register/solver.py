@@ -5,6 +5,7 @@ import socket
 import subprocess
 import sys
 import time
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -176,11 +177,33 @@ class TurnstileSolverProcess:
 
         lock_dir = self._repo_root / "data" / ".locks"
         lock_dir.mkdir(parents=True, exist_ok=True)
-        lock_path = lock_dir / "playwright_chromium_v1.lock"
-        if lock_path.exists():
+        marker_path = lock_dir / "playwright_chromium_v1.lock"
+        if marker_path.exists():
             return
+        install_lock_path = lock_dir / "playwright_chromium_install.lock"
+        lock_fd: int | None = None
 
         try:
+            # 进程间互斥，避免多实例并发执行 playwright install。
+            wait_deadline = time.time() + 180.0
+            while True:
+                try:
+                    lock_fd = os.open(
+                        str(install_lock_path),
+                        os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    )
+                    break
+                except FileExistsError:
+                    if marker_path.exists():
+                        return
+                    if time.time() >= wait_deadline:
+                        raise RuntimeError("Timed out waiting for playwright install lock")
+                    time.sleep(0.2)
+
+            # Double-check after lock in case another process completed just before us.
+            if marker_path.exists():
+                return
+
             logger.info("Installing Playwright Chromium (first run)...")
             args = [python_exe, "-m", "playwright", "install"]
             # On Linux (Docker), install system deps as well.
@@ -188,10 +211,20 @@ class TurnstileSolverProcess:
                 args.append("--with-deps")
             args.append("chromium")
             subprocess.check_call(args, cwd=str(self._repo_root))
-            lock_path.write_text(str(time.time()), encoding="utf-8")
+            marker_path.write_text(str(time.time()), encoding="utf-8")
         except Exception as exc:
             # Don't create lock file; let next run retry.
             raise RuntimeError(f"Playwright browser install failed: {exc}") from exc
+        finally:
+            if lock_fd is not None:
+                try:
+                    os.close(lock_fd)
+                except Exception:
+                    pass
+                try:
+                    install_lock_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     def _parse_host_port(self) -> tuple[str, int]:
         parsed = urlparse(self.config.url)
