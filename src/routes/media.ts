@@ -9,6 +9,31 @@ import { nextLocalMidnightExpirationSeconds } from "../kv/cleanup";
 
 export const mediaRoutes = new Hono<{ Bindings: Env }>();
 
+function envBool(value: string | undefined): boolean {
+  const v = String(value ?? "").trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes" || v === "on";
+}
+
+function parseCorsAllowList(raw: string | undefined): string[] {
+  const source = String(raw || "").trim();
+  if (!source) return ["http://127.0.0.1:8000", "http://localhost:8000"];
+  const items = source
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  return items.length ? items : ["http://127.0.0.1:8000", "http://localhost:8000"];
+}
+
+function resolveCorsOrigin(origin: string, allowList: string[]): string {
+  if (allowList.includes("*")) return "*";
+  const target = String(origin || "").trim().toLowerCase();
+  if (!target) return "";
+  for (const item of allowList) {
+    if (item.trim().toLowerCase() === target) return origin;
+  }
+  return "";
+}
+
 function guessCacheSeconds(path: string): number {
   const lower = path.toLowerCase();
   if (lower.endsWith(".mp4") || lower.endsWith(".webm") || lower.endsWith(".mov")) return 60 * 60 * 24;
@@ -43,7 +68,27 @@ function base64UrlDecode(input: string): string {
 
 function isAllowedUpstreamHost(hostname: string): boolean {
   const h = hostname.toLowerCase();
-  return h === "assets.grok.com" || h === "grok.com" || h.endsWith(".grok.com") || h.endsWith(".x.ai");
+  return h === "assets.grok.com";
+}
+
+function isSafeUpstreamPath(pathname: string): boolean {
+  const p = String(pathname || "").trim();
+  if (!p || p.length > 1024) return false;
+  if (p.includes("\\") || p.includes("..")) return false;
+  if (/[\u0000-\u001f]/.test(p)) return false;
+  return p.startsWith("/");
+}
+
+function isAllowedAssetPath(pathname: string): boolean {
+  const p = String(pathname || "").trim();
+  if (!p) return false;
+  if (/^\/users\/[0-9a-f-]{36}\/generated\/[0-9a-f-]{36}\/[A-Za-z0-9._-]{1,255}$/i.test(p)) {
+    return true;
+  }
+  if (/^\/upload-[A-Za-z0-9-]{8,}\.(png|jpg|jpeg|webp|gif)$/i.test(p)) {
+    return true;
+  }
+  return false;
 }
 
 function isUuid(s: string): boolean {
@@ -80,12 +125,14 @@ function responseFromBytes(args: {
   contentType: string;
   cacheSeconds: number;
   rangeHeader: string | undefined;
+  corsOrigin?: string;
 }): Response {
   const headers = new Headers();
   headers.set("Accept-Ranges", "bytes");
-  headers.set("Access-Control-Allow-Origin", "*");
+  if (args.corsOrigin) headers.set("Access-Control-Allow-Origin", args.corsOrigin);
   headers.set("Cache-Control", `public, max-age=${args.cacheSeconds}`);
   headers.set("Content-Type", args.contentType || "application/octet-stream");
+  headers.set("X-Content-Type-Options", "nosniff");
 
   const size = args.bytes.byteLength;
   const rangeHeader = args.rangeHeader;
@@ -143,6 +190,9 @@ function toUpstreamHeaders(args: { pathname: string; cookie: string; settings: A
 
 mediaRoutes.get("/images/:imgPath{.+}", async (c) => {
   const imgPath = c.req.param("imgPath");
+  const allowList = parseCorsAllowList(c.env.CORS_ALLOW_ORIGINS);
+  const corsOrigin = resolveCorsOrigin(c.req.header("Origin") ?? "", allowList);
+  const allowUrlProxy = envBool(c.env.ALLOW_IMAGE_URL_PROXY);
 
   let upstreamPath: string | null = null;
   let upstreamUrl: URL | null = null;
@@ -158,10 +208,16 @@ mediaRoutes.get("/images/:imgPath{.+}", async (c) => {
 
   // New encoding: u_<base64url(full_url)>
   if (imgPath.startsWith("u_")) {
+    if (!allowUrlProxy) {
+      return c.text("URL proxy mode is disabled", 400);
+    }
     try {
       const decodedUrl = base64UrlDecode(imgPath.slice(2));
       const u = new URL(decodedUrl);
-      if (isAllowedUpstreamHost(u.hostname)) upstreamUrl = u;
+      if (u.protocol === "https:" && isAllowedUpstreamHost(u.hostname)) {
+        u.hash = "";
+        upstreamUrl = u;
+      }
     } catch {
       upstreamUrl = null;
     }
@@ -172,8 +228,12 @@ mediaRoutes.get("/images/:imgPath{.+}", async (c) => {
   // Legacy encoding (best-effort): users-<uuid>-generated-<uuid>-image.jpg
   if (!upstreamPath) upstreamPath = decodeLegacyHyphenPath(imgPath);
 
-  // Very old encoding (lossy): replace '-' with '/' (breaks UUIDs)
-  if (!upstreamPath) upstreamPath = `/${imgPath.replaceAll("-", "/")}`;
+  // 兼容 KV 上传缓存名（upload-*.jpg 等）
+  if (!upstreamPath && /^[A-Za-z0-9._-]{1,255}$/.test(imgPath)) upstreamPath = `/${imgPath}`;
+
+  if (!upstreamPath) {
+    return c.text("Invalid image path", 400);
+  }
 
   // If upstreamPath accidentally contains a full URL, extract pathname.
   if (upstreamPath.startsWith("http://") || upstreamPath.startsWith("https://")) {
@@ -185,9 +245,13 @@ mediaRoutes.get("/images/:imgPath{.+}", async (c) => {
   }
 
   if (!upstreamPath.startsWith("/")) upstreamPath = `/${upstreamPath}`;
+  if (upstreamPath.includes("?")) upstreamPath = upstreamPath.split("?", 1)[0] ?? upstreamPath;
   upstreamPath = upstreamPath.replace(/\/{2,}/g, "/");
+  if (!isSafeUpstreamPath(upstreamPath)) return c.text("Invalid image path", 400);
 
   const originalPath = upstreamUrl?.pathname ?? upstreamPath;
+  if (!isSafeUpstreamPath(originalPath)) return c.text("Invalid upstream path", 400);
+  if (!isAllowedAssetPath(originalPath)) return c.text("Forbidden asset path", 403);
   const url = upstreamUrl ?? new URL(`https://assets.grok.com${originalPath}`);
   const type = detectTypeByPath(originalPath);
   const key = r2Key(type, imgPath);
@@ -200,7 +264,7 @@ mediaRoutes.get("/images/:imgPath{.+}", async (c) => {
   if (cached?.value) {
     c.executionCtx.waitUntil(touchCacheRow(c.env.DB, key, nowMs()));
     const contentType = (cached.metadata?.contentType as string | undefined) ?? "application/octet-stream";
-    return responseFromBytes({ bytes: cached.value, contentType, cacheSeconds, rangeHeader });
+    return responseFromBytes({ bytes: cached.value, contentType, cacheSeconds, rangeHeader, corsOrigin });
   }
 
   // stale metadata cleanup (best-effort)
@@ -229,7 +293,9 @@ mediaRoutes.get("/images/:imgPath{.+}", async (c) => {
   const contentLengthHeader = upstream.headers.get("content-length") ?? "";
   const contentLength = contentLengthHeader ? Number(contentLengthHeader) : NaN;
   const maxBytes = Math.min(25 * 1024 * 1024, Math.max(1, parseIntSafe(c.env.KV_CACHE_MAX_BYTES, 25 * 1024 * 1024)));
+  const canCache = !imgPath.startsWith("u_");
   const shouldTryCache =
+    canCache &&
     !rangeHeader &&
     (!Number.isFinite(contentLength) || (contentLength > 0 && contentLength <= maxBytes));
 
@@ -272,15 +338,17 @@ mediaRoutes.get("/images/:imgPath{.+}", async (c) => {
     );
 
     const outHeaders = new Headers(upstream.headers);
-    outHeaders.set("Access-Control-Allow-Origin", "*");
+    if (corsOrigin) outHeaders.set("Access-Control-Allow-Origin", corsOrigin);
     outHeaders.set("Cache-Control", `public, max-age=${cacheSeconds}`);
     if (contentType) outHeaders.set("Content-Type", contentType);
+    outHeaders.set("X-Content-Type-Options", "nosniff");
     return new Response(toClient, { status: upstream.status, headers: outHeaders });
   }
 
   const outHeaders = new Headers(upstream.headers);
-  outHeaders.set("Access-Control-Allow-Origin", "*");
+  if (corsOrigin) outHeaders.set("Access-Control-Allow-Origin", corsOrigin);
   outHeaders.set("Cache-Control", `public, max-age=${cacheSeconds}`);
   if (contentType) outHeaders.set("Content-Type", contentType);
+  outHeaders.set("X-Content-Type-Options", "nosniff");
   return new Response(upstream.body, { status: upstream.status, headers: outHeaders });
 });

@@ -18,8 +18,14 @@ function getBuildSha(env: Env): string {
   return v || "dev";
 }
 
+function envBool(v: unknown): boolean {
+  const raw = String(v ?? "").trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+}
+
 function isDebugRequest(c: any): boolean {
   try {
+    if (!envBool((c.env as Env).DEBUG_ERRORS)) return false;
     return new URL(c.req.url).searchParams.get("debug") === "1";
   } catch {
     return false;

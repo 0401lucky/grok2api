@@ -17,7 +17,7 @@ def _build_client(monkeypatch, tmp_path: Path) -> TestClient:
 def test_upload_image_respects_size_limit(monkeypatch, tmp_path: Path):
     client = _build_client(monkeypatch, tmp_path)
 
-    payload = b"x" * (1024 * 1024 + 1)
+    payload = b"\x89PNG\r\n\x1a\n" + b"x" * (1024 * 1024 + 1)
     resp = client.post(
         "/v1/uploads/image",
         files={"file": ("large.png", payload, "image/png")},
@@ -30,7 +30,7 @@ def test_upload_image_respects_size_limit(monkeypatch, tmp_path: Path):
 def test_upload_image_small_file_ok(monkeypatch, tmp_path: Path):
     client = _build_client(monkeypatch, tmp_path)
 
-    payload = b"ok" * 1024
+    payload = b"\x89PNG\r\n\x1a\n" + (b"ok" * 1024)
     resp = client.post(
         "/v1/uploads/image",
         files={"file": ("small.png", payload, "image/png")},

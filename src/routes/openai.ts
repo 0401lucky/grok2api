@@ -88,6 +88,7 @@ async function runTasksSettledWithLimit<T, R>(
 }
 
 export const openAiRoutes = new Hono<{ Bindings: Env; Variables: { apiAuth: ApiAuthInfo } }>();
+const ALLOWED_UPLOAD_MIME = new Set(["image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif"]);
 
 function parseCorsAllowList(raw: string | undefined): string[] {
   const source = String(raw || "").trim();
@@ -372,6 +373,32 @@ async function convertRawUrlByFormat(
     return toProxyUrl(args.baseUrl, encodeAssetPath(value));
   }
   return fetchImageAsBase64({ rawUrl: value, cookie: args.cookie, settings: args.settings });
+}
+
+function detectImageMime(bytes: Uint8Array): string | null {
+  if (bytes.length >= 8) {
+    const png = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+    if (png.every((v, i) => bytes[i] === v)) return "image/png";
+  }
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
+  if (bytes.length >= 6) {
+    const h = String.fromCharCode(...bytes.slice(0, 6));
+    if (h === "GIF87a" || h === "GIF89a") return "image/gif";
+  }
+  if (
+    bytes.length >= 12 &&
+    bytes[0] === 0x52 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x46 &&
+    bytes[8] === 0x57 &&
+    bytes[9] === 0x45 &&
+    bytes[10] === 0x42 &&
+    bytes[11] === 0x50
+  ) {
+    return "image/webp";
+  }
+  return null;
 }
 
 async function convertRawUrlsByFormatBestEffort(args: {
@@ -1337,7 +1364,19 @@ openAiRoutes.post("/chat/completions", async (c) => {
       const imgInputs = isVideoModel && images.length > 1 ? images.slice(0, 1) : images;
 
       try {
-        const uploads = await mapLimit(imgInputs, 5, (u) => uploadImage(u, cookie, settingsBundle.grok));
+        const uploads = await mapLimit(imgInputs, 5, (u) =>
+          uploadImage(u, cookie, settingsBundle.grok, {
+            requestOrigin: origin,
+            ...(c.env.IMAGE_FETCH_ALLOW_HOSTS
+              ? { allowHostsCsv: c.env.IMAGE_FETCH_ALLOW_HOSTS }
+              : {}),
+            maxBytes: Math.min(
+              20 * 1024 * 1024,
+              Math.max(1, parseIntSafe(c.env.IMAGE_FETCH_MAX_BYTES, 10 * 1024 * 1024)),
+            ),
+            timeoutMs: 10000,
+          }),
+        );
         const imgIds = uploads.map((u) => u.fileId).filter(Boolean);
         const imgUris = uploads.map((u) => u.fileUri).filter(Boolean);
 
@@ -2272,17 +2311,21 @@ openAiRoutes.post("/uploads/image", async (c) => {
     const file = form.get("file");
     if (!(file instanceof File)) return c.json(openAiError("Missing file", "missing_file"), 400);
 
-    const mime = String(file.type || "application/octet-stream");
-    if (!mime.toLowerCase().startsWith("image/"))
+    const mime = String(file.type || "application/octet-stream").toLowerCase();
+    if (!ALLOWED_UPLOAD_MIME.has(mime))
       return c.json(openAiError(`Unsupported mime: ${mime}`, "unsupported_file"), 400);
 
     const bytes = await file.arrayBuffer();
     const size = bytes.byteLength;
     const maxBytes = Math.min(25 * 1024 * 1024, Math.max(1, parseIntSafe(c.env.KV_CACHE_MAX_BYTES, 25 * 1024 * 1024)));
     if (size > maxBytes) return c.json(openAiError(`File too large (${size} > ${maxBytes})`, "file_too_large"), 413);
+    if (size <= 0) return c.json(openAiError("File is empty", "empty_file"), 400);
+    const magicMime = detectImageMime(new Uint8Array(bytes));
+    if (!magicMime) return c.json(openAiError("Invalid image content", "invalid_image"), 400);
+    const normalizedMime = magicMime === "image/jpeg" ? "image/jpeg" : magicMime;
 
     const ext = (() => {
-      const m = mime.toLowerCase();
+      const m = normalizedMime.toLowerCase();
       if (m === "image/png") return "png";
       if (m === "image/webp") return "webp";
       if (m === "image/gif") return "gif";
@@ -2298,7 +2341,7 @@ openAiRoutes.post("/uploads/image", async (c) => {
 
     await c.env.KV_CACHE.put(kvKey, bytes, {
       expiration: expiresAt,
-      metadata: { contentType: mime, size },
+      metadata: { contentType: normalizedMime, size },
     });
 
     const now = nowMs();
@@ -2306,7 +2349,7 @@ openAiRoutes.post("/uploads/image", async (c) => {
       key: kvKey,
       type: "image",
       size,
-      content_type: mime,
+      content_type: normalizedMime,
       created_at: now,
       last_access_at: now,
       expires_at: expiresAt * 1000,
