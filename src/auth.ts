@@ -27,6 +27,11 @@ function authError(message: string, code: string): Record<string, unknown> {
   };
 }
 
+function envBool(value: string | undefined): boolean {
+  const v = String(value ?? "").trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes" || v === "on";
+}
+
 export const requireApiAuth: MiddlewareHandler<{ Bindings: Env; Variables: { apiAuth: ApiAuthInfo } }> = async (
   c,
   next,
@@ -36,7 +41,8 @@ export const requireApiAuth: MiddlewareHandler<{ Bindings: Env; Variables: { api
 
   if (!token) {
     const globalKey = (settings.grok.api_key ?? "").trim();
-    if (!globalKey) {
+    const allowAnonBootstrap = envBool(c.env.ALLOW_ANON_API);
+    if (!globalKey && allowAnonBootstrap) {
       const row = await dbFirst<{ c: number }>(
         c.env.DB,
         "SELECT COUNT(1) as c FROM api_keys WHERE is_active = 1",
@@ -45,6 +51,9 @@ export const requireApiAuth: MiddlewareHandler<{ Bindings: Env; Variables: { api
         c.set("apiAuth", { key: null, name: "Anonymous", is_admin: false });
         return next();
       }
+    }
+    if (!globalKey) {
+      return c.json(authError("API key 未配置。请设置 key 或显式开启 ALLOW_ANON_API。", "api_key_not_configured"), 401);
     }
     return c.json(authError("缺少认证令牌", "missing_token"), 401);
   }

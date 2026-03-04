@@ -19,4 +19,22 @@ export interface Env {
 
   // Batch size for daily cleanup
   KV_CLEANUP_BATCH?: string;
+
+  // 显式允许无 API key 启动（仅用于受控 bootstrap）
+  ALLOW_ANON_API?: string;
+
+  // 是否允许通过 ?debug=1 输出错误细节（默认关闭）
+  DEBUG_ERRORS?: string;
+
+  // 仅用于受控环境 bootstrap：临时允许弱管理员密码
+  ALLOW_WEAK_ADMIN_PASSWORD?: string;
+
+  // 允许从远程 URL 拉取 image_url 的主机白名单（逗号分隔）
+  IMAGE_FETCH_ALLOW_HOSTS?: string;
+
+  // 远程 image_url 拉取的最大字节数
+  IMAGE_FETCH_MAX_BYTES?: string;
+
+  // 是否允许 /images/u_<base64url(full_url)> 代理模式
+  ALLOW_IMAGE_URL_PROXY?: string;
 }

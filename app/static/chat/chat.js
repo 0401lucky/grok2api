@@ -551,11 +551,17 @@ function clearImageWaterfall() {
 }
 
 function buildImagineWsUrl() {
-  const key = getUserApiKey();
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   const url = new URL('/api/v1/admin/imagine/ws', `${proto}//${window.location.host}`);
-  if (key) url.searchParams.set('api_key', key);
   return url.toString();
+}
+
+function getAdminSessionToken() {
+  try {
+    return String(localStorage.getItem('grok2api_admin_session') || '').trim();
+  } catch (e) {
+    return '';
+  }
 }
 
 function parseWsMessage(raw) {
@@ -569,7 +575,10 @@ function parseWsMessage(raw) {
 
 function openImageContinuousSocket(socketIndex, runToken, prompt, aspectRatio, attempt = 0) {
   const wsUrl = buildImagineWsUrl();
-  const ws = new WebSocket(wsUrl);
+  const adminSessionToken = getAdminSessionToken();
+  const ws = adminSessionToken
+    ? new WebSocket(wsUrl, ['g2a-admin-session', adminSessionToken])
+    : new WebSocket(wsUrl);
   const socketState = {
     index: socketIndex,
     ws,
@@ -652,7 +661,7 @@ function openImageContinuousSocket(socketIndex, runToken, prompt, aspectRatio, a
       const stillOpen = getImageContinuousOpenCount();
 
       if (event?.code === 1008 && stillActive <= 0 && stillOpen <= 0) {
-        setImageContinuousError('WebSocket auth rejected. Check API key.');
+        setImageContinuousError('WebSocket auth rejected. Please login admin session first.');
         setImageStatusText('Auth failed');
       } else if (socketState.hadError && stillActive <= 0 && stillOpen <= 0) {
         const closeCode = Number(event?.code || 0);
@@ -731,6 +740,10 @@ function startImageContinuous() {
   }
   if (!getUserApiKey()) {
     showToast('Please input API key first', 'warning');
+    return;
+  }
+  if (!getAdminSessionToken()) {
+    showToast('连续出图需要管理员会话，请先登录后台', 'warning');
     return;
   }
 

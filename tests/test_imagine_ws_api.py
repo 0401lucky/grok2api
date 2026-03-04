@@ -7,22 +7,32 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from app.api.v1 import admin as admin_api
+from app.core import admin_session as admin_session_module
 
 
-def _build_client(monkeypatch: pytest.MonkeyPatch, api_key: str = "test-key") -> TestClient:
-    async def _fake_legacy_keys():
-        return set()
+def _mock_get_config(key: str, default=None):
+    values = {
+        "app.admin_username": "admin",
+        "app.app_key": "unit-test-secret",
+        "app.admin_session_ttl_hours": 8,
+    }
+    return values.get(key, default)
 
-    monkeypatch.setattr(admin_api, "_load_legacy_api_keys", _fake_legacy_keys)
-    monkeypatch.setattr(
-        admin_api,
-        "get_config",
-        lambda key, default=None: api_key if key == "app.api_key" else default,
-    )
+
+def _build_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    monkeypatch.setattr(admin_api, "get_config", _mock_get_config)
+    monkeypatch.setattr(admin_session_module, "get_config", _mock_get_config)
 
     app = FastAPI()
     app.include_router(admin_api.router)
     return TestClient(app)
+
+
+def _ws_headers(token: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Origin": "http://localhost:8000",
+    }
 
 
 def _recv_until(ws, predicate, max_messages: int = 80):
@@ -34,43 +44,51 @@ def _recv_until(ws, predicate, max_messages: int = 80):
 
 
 def test_imagine_ws_rejects_invalid_api_key(monkeypatch: pytest.MonkeyPatch):
-    client = _build_client(monkeypatch, api_key="valid-key")
+    client = _build_client(monkeypatch)
     with pytest.raises(WebSocketDisconnect) as exc:
-        with client.websocket_connect("/api/v1/admin/imagine/ws?api_key=wrong-key"):
+        with client.websocket_connect(
+            "/api/v1/admin/imagine/ws",
+            headers=_ws_headers("wrong-key"),
+        ):
             pass
     assert exc.value.code == 1008
 
 
 def test_imagine_ws_ping_pong(monkeypatch: pytest.MonkeyPatch):
-    client = _build_client(monkeypatch, api_key="valid-key")
-    with client.websocket_connect("/api/v1/admin/imagine/ws?api_key=valid-key") as ws:
+    client = _build_client(monkeypatch)
+    token = admin_session_module.create_admin_session_token("admin")
+    with client.websocket_connect("/api/v1/admin/imagine/ws", headers=_ws_headers(token)) as ws:
         ws.send_json({"type": "ping"})
         msg = ws.receive_json()
     assert msg == {"type": "pong"}
 
 
-def test_imagine_ws_accepts_managed_api_key(monkeypatch: pytest.MonkeyPatch):
-    client = _build_client(monkeypatch, api_key="global-key")
+def test_imagine_ws_rejects_untrusted_origin(monkeypatch: pytest.MonkeyPatch):
+    client = _build_client(monkeypatch)
+    token = admin_session_module.create_admin_session_token("admin")
+    headers = _ws_headers(token)
+    headers["Origin"] = "https://evil.example.com"
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with client.websocket_connect("/api/v1/admin/imagine/ws", headers=headers):
+            pass
+    assert exc.value.code == 1008
 
-    async def _fake_init():
-        return None
 
-    monkeypatch.setattr(admin_api.api_key_manager, "init", _fake_init)
-    monkeypatch.setattr(
-        admin_api.api_key_manager,
-        "validate_key",
-        lambda token: {"key": token, "is_active": True} if token == "managed-key" else None,
-    )
-
-    with client.websocket_connect("/api/v1/admin/imagine/ws?api_key=managed-key") as ws:
-        ws.send_json({"type": "ping"})
-        msg = ws.receive_json()
-    assert msg == {"type": "pong"}
+def test_imagine_ws_rejects_non_admin_session_token(monkeypatch: pytest.MonkeyPatch):
+    client = _build_client(monkeypatch)
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with client.websocket_connect(
+            "/api/v1/admin/imagine/ws",
+            headers=_ws_headers("managed-key"),
+        ):
+            pass
+    assert exc.value.code == 1008
 
 
 def test_imagine_ws_empty_prompt_error(monkeypatch: pytest.MonkeyPatch):
-    client = _build_client(monkeypatch, api_key="valid-key")
-    with client.websocket_connect("/api/v1/admin/imagine/ws?api_key=valid-key") as ws:
+    client = _build_client(monkeypatch)
+    token = admin_session_module.create_admin_session_token("admin")
+    with client.websocket_connect("/api/v1/admin/imagine/ws", headers=_ws_headers(token)) as ws:
         ws.send_json({"type": "start", "prompt": "   "})
         msg = ws.receive_json()
 
@@ -79,7 +97,7 @@ def test_imagine_ws_empty_prompt_error(monkeypatch: pytest.MonkeyPatch):
 
 
 def test_imagine_ws_start_stop_message_flow(monkeypatch: pytest.MonkeyPatch):
-    client = _build_client(monkeypatch, api_key="valid-key")
+    client = _build_client(monkeypatch)
 
     class _DummyTokenManager:
         def __init__(self):
@@ -112,7 +130,8 @@ def test_imagine_ws_start_stop_message_flow(monkeypatch: pytest.MonkeyPatch):
     )
     monkeypatch.setattr(admin_api, "_collect_imagine_batch", _fake_collect_imagine_batch)
 
-    with client.websocket_connect("/api/v1/admin/imagine/ws?api_key=valid-key") as ws:
+    token = admin_session_module.create_admin_session_token("admin")
+    with client.websocket_connect("/api/v1/admin/imagine/ws", headers=_ws_headers(token)) as ws:
         ws.send_json({"type": "start", "prompt": "a cat", "aspect_ratio": "1:1"})
         running = _recv_until(
             ws,
@@ -140,7 +159,7 @@ def test_imagine_ws_start_stop_message_flow(monkeypatch: pytest.MonkeyPatch):
 
 
 def test_imagine_ws_stop_immediately_remains_healthy(monkeypatch: pytest.MonkeyPatch):
-    client = _build_client(monkeypatch, api_key="valid-key")
+    client = _build_client(monkeypatch)
 
     class _DummyTokenManager:
         async def reload_if_stale(self):
@@ -169,7 +188,8 @@ def test_imagine_ws_stop_immediately_remains_healthy(monkeypatch: pytest.MonkeyP
     )
     monkeypatch.setattr(admin_api, "_collect_imagine_batch", _slow_collect_imagine_batch)
 
-    with client.websocket_connect("/api/v1/admin/imagine/ws?api_key=valid-key") as ws:
+    token = admin_session_module.create_admin_session_token("admin")
+    with client.websocket_connect("/api/v1/admin/imagine/ws", headers=_ws_headers(token)) as ws:
         ws.send_json({"type": "start", "prompt": "a fox", "aspect_ratio": "1:1"})
         running = _recv_until(
             ws,

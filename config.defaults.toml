@@ -17,7 +17,8 @@ image_generation_method = "legacy"
 [app]
 app_url = "http://127.0.0.1:8000"
 admin_username = "admin"
-app_key = "admin"
+# 安全默认值：必须在首次部署后修改，否则后台登录会被拒绝。
+app_key = "__CHANGE_ME__"
 admin_session_ttl_hours = 8
 api_key = ""
 image_format = "url"

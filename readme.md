@@ -83,7 +83,7 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml config
 
 访问地址：`http://<host>:8000/login`
 
-默认账号密码：`admin` / `admin`（对应配置项 `app.admin_username` / `app.app_key`，建议上线后修改）。
+默认用户名为 `admin`，**默认密码为占位值并会被登录接口拒绝**。请先在配置中将 `app.app_key` 改为强密码后再登录。
 
 常用页面：
 - `http://<host>:8000/admin/token`：Token 管理（导入/导出/批量操作/自动注册）

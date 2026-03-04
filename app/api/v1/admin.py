@@ -9,6 +9,7 @@ from app.core.admin_session import (
     create_admin_session_token,
     verify_admin_session,
     verify_admin_session_token,
+    revoke_admin_session_token,
 )
 import os
 from pathlib import Path
@@ -18,6 +19,7 @@ import json
 import time
 import uuid
 import orjson
+from urllib.parse import urlparse
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 from app.core.logger import logger
 from app.services.register import get_auto_register_manager
@@ -35,7 +37,6 @@ from app.services.grok.imagine_generation import (
     resolve_aspect_ratio as resolve_imagine_aspect_ratio,
 )
 from app.services.token import get_token_manager
-from app.core.auth import _load_legacy_api_keys
 
 
 router = APIRouter()
@@ -105,27 +106,76 @@ async def admin_chat_page():
     return await render_template("chat/chat_admin.html")
 
 
-async def _verify_ws_api_key(websocket: WebSocket) -> bool:
-    token = str(websocket.query_params.get("api_key") or "").strip()
-    if not token:
-        return False
+def _parse_ws_subprotocols(websocket: WebSocket) -> list[str]:
+    raw = str(websocket.headers.get("sec-websocket-protocol") or "").strip()
+    if not raw:
+        return []
+    return [part.strip() for part in raw.split(",") if part.strip()]
 
-    # 首选后台会话 token（登录接口返回）。
-    if verify_admin_session_token(token):
-        return True
 
-    # 向后兼容：允许使用全局 API key / legacy key / 托管 key。
-    api_key = str(get_config("app.api_key", "") or "").strip()
-    legacy_keys = await _load_legacy_api_keys()
-    if (api_key and token == api_key) or token in legacy_keys:
+def _extract_ws_admin_session_token(websocket: WebSocket) -> str:
+    # 首选 Authorization: Bearer <token>
+    auth = str(websocket.headers.get("authorization") or "").strip()
+    if auth.lower().startswith("bearer "):
+        token = auth[7:].strip()
+        if token:
+            return token
+
+    # 兼容浏览器：通过 Sec-WebSocket-Protocol 传 token
+    # 约定：new WebSocket(url, ["g2a-admin-session", "<session_token>"])
+    protocols = _parse_ws_subprotocols(websocket)
+    if protocols:
+        if "g2a-admin-session" in protocols:
+            idx = protocols.index("g2a-admin-session")
+            if idx + 1 < len(protocols):
+                token = protocols[idx + 1].strip()
+                if token:
+                    return token
+        # 兜底：支持单协议直传 token
+        if len(protocols) == 1:
+            single = protocols[0].strip()
+            if single and single != "g2a-admin-session":
+                return single
+
+    return ""
+
+
+def _is_allowed_ws_origin(websocket: WebSocket) -> bool:
+    origin = str(websocket.headers.get("origin") or "").strip()
+    if not origin:
+        # 非浏览器客户端通常不会携带 Origin，允许其继续鉴权流程
         return True
     try:
-        await api_key_manager.init()
-        if api_key_manager.validate_key(token):
-            return True
-    except Exception as e:
-        logger.warning(f"Imagine ws api_key validation fallback failed: {e}")
-    return False
+        parsed = urlparse(origin)
+        origin_host = (parsed.netloc or "").lower()
+    except Exception:
+        origin_host = ""
+    req_host = str(websocket.headers.get("host") or "").strip().lower()
+    if origin_host and req_host and origin_host == req_host:
+        return True
+    raw = str(
+        os.getenv("CORS_ALLOW_ORIGINS", "http://127.0.0.1:8000,http://localhost:8000")
+        or ""
+    ).strip()
+    allowed = {item.strip().lower() for item in raw.split(",") if item.strip()}
+    return origin.lower() in allowed
+
+
+def _is_weak_admin_secret(secret: str) -> bool:
+    normalized = str(secret or "").strip().lower()
+    return normalized in {"", "admin", "__change_me__", "grok2api"}
+
+
+def _allow_weak_admin_password() -> bool:
+    raw = str(os.getenv("ALLOW_WEAK_ADMIN_PASSWORD", "") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+async def _verify_ws_admin_session(websocket: WebSocket) -> bool:
+    if not _is_allowed_ws_origin(websocket):
+        return False
+    token = _extract_ws_admin_session_token(websocket)
+    return bool(token and verify_admin_session_token(token))
 
 
 async def _collect_imagine_batch(token: str, prompt: str, aspect_ratio: str) -> list[str]:
@@ -141,11 +191,15 @@ async def _collect_imagine_batch(token: str, prompt: str, aspect_ratio: str) -> 
 
 @router.websocket("/api/v1/admin/imagine/ws")
 async def admin_imagine_ws(websocket: WebSocket):
-    if not await _verify_ws_api_key(websocket):
+    if not await _verify_ws_admin_session(websocket):
         await websocket.close(code=1008)
         return
 
-    await websocket.accept()
+    protocols = _parse_ws_subprotocols(websocket)
+    if "g2a-admin-session" in protocols:
+        await websocket.accept(subprotocol="g2a-admin-session")
+    else:
+        await websocket.accept()
     stop_event = asyncio.Event()
     run_task: Optional[asyncio.Task] = None
 
@@ -335,7 +389,7 @@ async def admin_login_api(request: Request, body: AdminLoginBody | None = Body(d
     """管理后台登录验证（用户名+密码）
 
     - 登录成功后返回短期后台会话 token（用于 `/api/v1/admin/*` 鉴权）
-    - 默认账号/密码：admin/admin（可在配置管理的「应用设置」里修改）
+    - 后台弱密码（如 admin / 空密码）会被拒绝登录，需先改为强密码
     - 兼容旧版本：允许 Authorization: Bearer <password> 仅密码登录（用户名默认为 admin）
     """
 
@@ -359,6 +413,13 @@ async def admin_login_api(request: Request, body: AdminLoginBody | None = Body(d
     if not admin_password:
         raise HTTPException(status_code=503, detail="Admin password is not configured")
 
+    if _is_weak_admin_secret(admin_password) and not _allow_weak_admin_password():
+        raise HTTPException(
+            status_code=503,
+            detail="Admin password is weak or not initialized. Please set app.app_key to a strong value first. "
+            "If this is a controlled bootstrap, set ALLOW_WEAK_ADMIN_PASSWORD=true temporarily.",
+        )
+
     if username != admin_username or password != admin_password:
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
@@ -371,6 +432,16 @@ async def admin_login_api(request: Request, body: AdminLoginBody | None = Body(d
     session_token = create_admin_session_token(admin_username, ttl_hours=session_ttl_hours)
     # 为兼容现有前端结构，仍沿用字段名 api_key，值改为后台会话 token。
     return {"status": "success", "api_key": session_token}
+
+
+@router.post("/api/v1/admin/logout")
+async def admin_logout_api(session_token: str = Depends(verify_admin_session)):
+    """注销当前后台会话（服务端立即失效）。"""
+    try:
+        revoke_admin_session_token(session_token)
+    except Exception as e:
+        logger.warning(f"Admin logout revoke failed: {e}")
+    return {"status": "success"}
 
 @router.get("/api/v1/admin/config", dependencies=[Depends(verify_admin_session)])
 async def get_config_api():

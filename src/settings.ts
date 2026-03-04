@@ -91,7 +91,7 @@ const DEFAULTS: SettingsBundle = {
     log_level: "INFO",
     image_mode: "url",
     admin_username: "admin",
-    admin_password: "admin",
+    admin_password: "__CHANGE_ME__",
     image_cache_max_size_mb: 512,
     video_cache_max_size_mb: 1024,
   },

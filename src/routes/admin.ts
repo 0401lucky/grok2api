@@ -14,13 +14,12 @@ import {
   batchUpdateApiKeyStatus,
   deleteApiKey,
   listApiKeys,
-  validateApiKey,
   updateApiKeyLimits,
   updateApiKeyName,
   updateApiKeyStatus,
 } from "../repo/apiKeys";
 import { displayKey } from "../utils/crypto";
-import { createAdminSession, deleteAdminSession } from "../repo/adminSessions";
+import { createAdminSession, deleteAdminSession, verifyAdminSession } from "../repo/adminSessions";
 import {
   addTokens,
   addTokenTag,
@@ -45,7 +44,7 @@ import { acceptTos } from "../grok/tos";
 import { setBirthDate } from "../grok/birthDate";
 import { checkRateLimits } from "../grok/rateLimits";
 import { addRequestLog, clearRequestLogs, getRequestLogs, getRequestStats } from "../repo/logs";
-import { getRefreshProgress, setRefreshProgress } from "../repo/refreshProgress";
+import { getRefreshProgress, setRefreshProgress, tryStartRefreshProgress } from "../repo/refreshProgress";
 import {
   deleteCacheRows,
   getCacheSizeBytes,
@@ -65,6 +64,60 @@ function parseBearer(auth: string | null): string | null {
   if (!auth) return null;
   const m = auth.match(/^Bearer\s+(.+)$/i);
   return m?.[1]?.trim() || null;
+}
+
+function isWeakAdminPassword(password: string | undefined): boolean {
+  const normalized = String(password ?? "").trim().toLowerCase();
+  return normalized === "" || normalized === "admin" || normalized === "__change_me__" || normalized === "grok2api";
+}
+
+function allowWeakAdminPassword(c: any): boolean {
+  const raw = String(c.env.ALLOW_WEAK_ADMIN_PASSWORD ?? "").trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+}
+
+function parseWsSubprotocols(raw: string | null): string[] {
+  const text = String(raw ?? "").trim();
+  if (!text) return [];
+  return text
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function extractWsAdminSessionToken(c: any): string {
+  const authToken = parseBearer(c.req.header("Authorization") ?? null);
+  if (authToken) return authToken;
+
+  const protocols = parseWsSubprotocols(c.req.header("Sec-WebSocket-Protocol") ?? null);
+  if (!protocols.length) return "";
+  if (protocols.includes("g2a-admin-session")) {
+    const idx = protocols.indexOf("g2a-admin-session");
+    if (idx + 1 < protocols.length) {
+      return protocols[idx + 1] ?? "";
+    }
+  }
+  if (protocols.length === 1 && protocols[0] !== "g2a-admin-session") {
+    return protocols[0] ?? "";
+  }
+  return "";
+}
+
+function isAllowedWsOrigin(c: any): boolean {
+  const origin = String(c.req.header("Origin") ?? "").trim();
+  if (!origin) return true;
+  try {
+    const originHost = new URL(origin).host.toLowerCase();
+    const reqHost = String(c.req.header("Host") ?? "").trim().toLowerCase();
+    if (originHost && reqHost && originHost === reqHost) return true;
+  } catch {
+    // ignore parse error
+  }
+  const allowList = String(c.env.CORS_ALLOW_ORIGINS ?? "http://127.0.0.1:8000,http://localhost:8000")
+    .split(",")
+    .map((s: string) => s.trim().toLowerCase())
+    .filter(Boolean);
+  return allowList.includes(origin.toLowerCase());
 }
 
 function validateTokenType(token_type: string): "sso" | "ssoSuper" {
@@ -144,7 +197,8 @@ function base64UrlEncodeString(input: string): string {
 function encodeAssetPath(raw: string): string {
   try {
     const u = new URL(raw);
-    return `u_${base64UrlEncodeString(u.toString())}`;
+    const p = u.pathname.startsWith("/") ? u.pathname : `/${u.pathname}`;
+    return `p_${base64UrlEncodeString(p)}`;
   } catch {
     const p = raw.startsWith("/") ? raw : `/${raw}`;
     return `p_${base64UrlEncodeString(p)}`;
@@ -184,23 +238,11 @@ function parseImagineWsFailureStatus(message: string): number {
   return 500;
 }
 
-async function verifyWsApiKeyForImagine(c: any): Promise<boolean> {
-  const settings = await getSettings(c.env);
-  const globalKey = String(settings.grok.api_key ?? "").trim();
-  const token = String(c.req.query("api_key") ?? "").trim();
-
-  if (token) {
-    if (globalKey && token === globalKey) return true;
-    const keyInfo = await validateApiKey(c.env.DB, token);
-    return Boolean(keyInfo);
-  }
-
-  if (globalKey) return false;
-  const row = await dbFirst<{ c: number }>(
-    c.env.DB,
-    "SELECT COUNT(1) as c FROM api_keys WHERE is_active = 1",
-  );
-  return (row?.c ?? 0) === 0;
+async function verifyWsAdminSessionForImagine(c: any): Promise<boolean> {
+  if (!isAllowedWsOrigin(c)) return false;
+  const token = extractWsAdminSessionToken(c);
+  if (!token) return false;
+  return verifyAdminSession(c.env.DB, token);
 }
 
 export const adminRoutes = new Hono<{ Bindings: Env }>();
@@ -264,6 +306,10 @@ adminRoutes.post("/api/v1/admin/login", async (c) => {
     const username = String(body?.username ?? "").trim();
     const password = String(body?.password ?? "").trim();
 
+    if (isWeakAdminPassword(settings.global.admin_password) && !allowWeakAdminPassword(c)) {
+      return c.json(legacyErr("Admin password is weak or not initialized. Please set a strong password first."), 503);
+    }
+
     if (username !== settings.global.admin_username || password !== settings.global.admin_password) {
       return c.json(legacyErr("Invalid username or password"), 401);
     }
@@ -290,8 +336,8 @@ adminRoutes.get("/api/v1/admin/config", requireAdminAuth, async (c) => {
     return c.json({
       app: {
         api_key: settings.grok.api_key ?? "",
-        admin_username: settings.global.admin_username ?? "admin",
-        app_key: settings.global.admin_password ?? "admin",
+        admin_username: settings.global.admin_username ?? "",
+        app_key: settings.global.admin_password ?? "",
         app_url: settings.global.base_url ?? "",
         image_format: settings.global.image_mode ?? "url",
         video_format: "url",
@@ -361,8 +407,8 @@ adminRoutes.post("/api/v1/admin/config", requireAdminAuth, async (c) => {
 
     if (appCfg && typeof appCfg === "object") {
       if (typeof appCfg.api_key === "string") grok_config.api_key = appCfg.api_key.trim();
-      if (typeof appCfg.admin_username === "string") global_config.admin_username = appCfg.admin_username.trim() || "admin";
-      if (typeof appCfg.app_key === "string") global_config.admin_password = appCfg.app_key.trim() || "admin";
+      if (typeof appCfg.admin_username === "string") global_config.admin_username = appCfg.admin_username.trim();
+      if (typeof appCfg.app_key === "string") global_config.admin_password = appCfg.app_key.trim();
       if (typeof appCfg.app_url === "string") global_config.base_url = appCfg.app_url.trim();
       if (appCfg.image_format === "url" || appCfg.image_format === "base64" || appCfg.image_format === "b64_json")
         global_config.image_mode = appCfg.image_format;
@@ -448,7 +494,7 @@ adminRoutes.get("/api/v1/admin/imagine/ws", async (c) => {
   const server = wsPair[1];
   server.accept();
 
-  const authed = await verifyWsApiKeyForImagine(c);
+  const authed = await verifyWsAdminSessionForImagine(c);
   if (!authed) {
     try {
       server.close(1008, "Auth failed");
@@ -819,6 +865,16 @@ adminRoutes.post("/api/v1/admin/tokens/refresh", requireAdminAuth, async (c) => 
     return c.json(legacyOk({ results }));
   } catch (e) {
     return c.json(legacyErr(`Refresh failed: ${e instanceof Error ? e.message : String(e)}`), 500);
+  }
+});
+
+adminRoutes.post("/api/v1/admin/logout", requireAdminAuth, async (c) => {
+  try {
+    const token = parseBearer(c.req.header("Authorization") ?? null);
+    if (token) await deleteAdminSession(c.env.DB, token);
+    return c.json(legacyOk({ message: "登出成功" }));
+  } catch (e) {
+    return c.json(legacyErr(`Logout error: ${e instanceof Error ? e.message : String(e)}`), 500);
   }
 });
 
@@ -1306,6 +1362,10 @@ adminRoutes.post("/api/login", async (c) => {
     const body = (await c.req.json()) as { username?: string; password?: string };
     const settings = await getSettings(c.env);
 
+    if (isWeakAdminPassword(settings.global.admin_password) && !allowWeakAdminPassword(c)) {
+      return c.json({ success: false, message: "管理员密码过弱或未初始化，请先设置强密码" }, 503);
+    }
+
     if (body.username !== settings.global.admin_username || body.password !== settings.global.admin_password) {
       return c.json({ success: false, message: "用户名或密码错误" });
     }
@@ -1497,19 +1557,14 @@ adminRoutes.post("/api/tokens/test", requireAdminAuth, async (c) => {
 
 adminRoutes.post("/api/tokens/refresh-all", requireAdminAuth, async (c) => {
   try {
-    const progress = await getRefreshProgress(c.env.DB);
-    if (progress.running) {
+    const claimed = await tryStartRefreshProgress(c.env.DB, 0);
+    if (!claimed) {
+      const progress = await getRefreshProgress(c.env.DB);
       return c.json({ success: false, message: "刷新任务正在进行中", data: progress });
     }
 
     const tokens = await listTokens(c.env.DB);
-    await setRefreshProgress(c.env.DB, {
-      running: true,
-      current: 0,
-      total: tokens.length,
-      success: 0,
-      failed: 0,
-    });
+    await setRefreshProgress(c.env.DB, { running: true, current: 0, total: tokens.length, success: 0, failed: 0 });
 
     const settings = await getSettings(c.env);
     const cf = normalizeCfCookie(settings.grok.cf_clearance ?? "");

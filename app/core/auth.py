@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from typing import Optional, Set
 
@@ -25,6 +26,11 @@ LEGACY_API_KEYS_FILE = Path(__file__).parent.parent.parent / "data" / "api_keys.
 _legacy_api_keys_cache: Set[str] | None = None
 _legacy_api_keys_mtime: float | None = None
 _legacy_api_keys_lock = asyncio.Lock()
+
+
+def _allow_anonymous_api() -> bool:
+    raw = str(os.getenv("ALLOW_ANON_API", "") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 async def _load_legacy_api_keys() -> Set[str]:
@@ -93,15 +99,21 @@ async def verify_api_key(
     """
     验证 Bearer Token
 
-    - 若 `app.api_key` 未配置且不存在 legacy keys，则跳过验证。
-    - 若配置了 `app.api_key` 或存在 legacy keys，则必须提供 Authorization: Bearer <key>。
+    - 默认严格鉴权（fail-close）。
+    - 仅当显式设置 `ALLOW_ANON_API=true` 且未配置任何 key 时，允许匿名访问。
     """
     api_key = str(get_config("app.api_key", "") or "").strip()
     legacy_keys = await _load_legacy_api_keys()
 
-    # 如果未配置 API Key 且没有 legacy keys，直接放行
+    # 仅在显式配置开关时允许匿名访问
     if not api_key and not legacy_keys:
-        return None
+        if _allow_anonymous_api():
+            return None
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="API key is not configured. Set app.api_key or ALLOW_ANON_API=true for bootstrap.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     if not auth:
         raise HTTPException(

@@ -130,7 +130,7 @@ python scripts/smoke_test.py --base-url https://<你的域名或workers.dev>
 ```
 
 默认管理员账号密码：
-- `admin / admin`
+- 默认用户名 `admin`；默认密码为占位值，需先改为强密码后再登录
 
 强烈建议登录后立刻修改（在「设置」里改 `admin_password` / `admin_username`）。
 

@@ -12,7 +12,9 @@ import hmac
 import json
 import os
 import secrets
+import threading
 import time
+from pathlib import Path
 from typing import Optional
 
 from fastapi import HTTPException, Security, status
@@ -23,6 +25,11 @@ from app.core.config import get_config
 
 SESSION_TOKEN_PREFIX = "g2a"
 DEFAULT_SESSION_HOURS = 8
+REVOCATION_FILE = Path(__file__).parent.parent.parent / "data" / "admin_session_revocations.json"
+
+_revoked_jti_cache: dict[str, int] | None = None
+_revoked_jti_mtime: float | None = None
+_revoked_jti_lock = threading.Lock()
 
 security = HTTPBearer(
     auto_error=False,
@@ -57,6 +64,108 @@ def _sign(payload_b64: str, secret: bytes) -> str:
     return _b64url_encode(digest)
 
 
+def _read_revocations_file_unlocked() -> dict[str, int]:
+    if not REVOCATION_FILE.exists():
+        return {}
+    try:
+        raw = REVOCATION_FILE.read_text(encoding="utf-8")
+        data = json.loads(raw) if raw.strip() else {}
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, int] = {}
+    for k, v in data.items():
+        key = str(k or "").strip()
+        if not key:
+            continue
+        try:
+            exp = int(v)
+        except Exception:
+            continue
+        out[key] = exp
+    return out
+
+
+def _write_revocations_file_unlocked(data: dict[str, int]) -> None:
+    REVOCATION_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = REVOCATION_FILE.with_suffix(".tmp")
+    tmp.write_text(
+        json.dumps(data, separators=(",", ":"), ensure_ascii=False),
+        encoding="utf-8",
+    )
+    os.replace(tmp, REVOCATION_FILE)
+
+
+def _load_revocations() -> dict[str, int]:
+    global _revoked_jti_cache, _revoked_jti_mtime
+
+    try:
+        mtime = REVOCATION_FILE.stat().st_mtime if REVOCATION_FILE.exists() else None
+    except Exception:
+        mtime = None
+
+    if _revoked_jti_cache is not None and _revoked_jti_mtime == mtime:
+        return _revoked_jti_cache
+
+    with _revoked_jti_lock:
+        try:
+            mtime = REVOCATION_FILE.stat().st_mtime if REVOCATION_FILE.exists() else None
+        except Exception:
+            mtime = None
+        if _revoked_jti_cache is not None and _revoked_jti_mtime == mtime:
+            return _revoked_jti_cache
+
+        data = _read_revocations_file_unlocked()
+        now = int(time.time())
+        filtered = {k: exp for k, exp in data.items() if exp > now}
+
+        if filtered != data:
+            try:
+                _write_revocations_file_unlocked(filtered)
+                mtime = REVOCATION_FILE.stat().st_mtime if REVOCATION_FILE.exists() else None
+            except Exception:
+                pass
+
+        _revoked_jti_cache = filtered
+        _revoked_jti_mtime = mtime
+        return filtered
+
+
+def _is_revoked_jti(jti: str, now: int | None = None) -> bool:
+    token_id = str(jti or "").strip()
+    if not token_id:
+        return False
+    if now is None:
+        now = int(time.time())
+    revoked = _load_revocations()
+    exp = revoked.get(token_id)
+    return bool(exp and exp > now)
+
+
+def _decode_session_payload(raw: str) -> dict | None:
+    token = str(raw or "").strip()
+    if not token:
+        return None
+    parts = token.split(".")
+    if len(parts) != 3 or parts[0] != SESSION_TOKEN_PREFIX:
+        return None
+    payload_b64 = parts[1]
+    signature = parts[2]
+    secret = _session_secret()
+    if not secret:
+        return None
+    expected_signature = _sign(payload_b64, secret)
+    if not hmac.compare_digest(signature, expected_signature):
+        return None
+    try:
+        payload_raw = _b64url_decode(payload_b64)
+        payload = json.loads(payload_raw.decode("utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def create_admin_session_token(username: str, ttl_hours: int = DEFAULT_SESSION_HOURS) -> str:
     """签发后台会话令牌。"""
     ttl = max(1, int(ttl_hours or DEFAULT_SESSION_HOURS))
@@ -66,6 +175,7 @@ def create_admin_session_token(username: str, ttl_hours: int = DEFAULT_SESSION_H
         "u": str(username or "admin"),
         "iat": now,
         "exp": now + ttl * 3600,
+        "jti": secrets.token_urlsafe(16),
         "n": secrets.token_urlsafe(12),
     }
     payload_b64 = _b64url_encode(
@@ -80,30 +190,8 @@ def create_admin_session_token(username: str, ttl_hours: int = DEFAULT_SESSION_H
 
 def verify_admin_session_token(token: str) -> bool:
     """校验后台会话令牌。"""
-    raw = str(token or "").strip()
-    if not raw:
-        return False
-    parts = raw.split(".")
-    if len(parts) != 3 or parts[0] != SESSION_TOKEN_PREFIX:
-        return False
-
-    payload_b64 = parts[1]
-    signature = parts[2]
-    secret = _session_secret()
-    if not secret:
-        return False
-
-    expected_signature = _sign(payload_b64, secret)
-    if not hmac.compare_digest(signature, expected_signature):
-        return False
-
-    try:
-        payload_raw = _b64url_decode(payload_b64)
-        payload = json.loads(payload_raw.decode("utf-8"))
-    except Exception:
-        return False
-
-    if not isinstance(payload, dict):
+    payload = _decode_session_payload(token)
+    if not payload:
         return False
 
     try:
@@ -112,7 +200,44 @@ def verify_admin_session_token(token: str) -> bool:
         return False
 
     now = int(time.time())
-    return exp > now
+    if exp <= now:
+        return False
+
+    jti = str(payload.get("jti") or "").strip()
+    if jti and _is_revoked_jti(jti, now=now):
+        return False
+    return True
+
+
+def revoke_admin_session_token(token: str) -> bool:
+    payload = _decode_session_payload(token)
+    if not payload:
+        return False
+
+    jti = str(payload.get("jti") or "").strip()
+    if not jti:
+        return False
+    try:
+        exp = int(payload.get("exp") or 0)
+    except Exception:
+        exp = 0
+    if exp <= 0:
+        return False
+
+    global _revoked_jti_cache, _revoked_jti_mtime
+    with _revoked_jti_lock:
+        now = int(time.time())
+        data = _read_revocations_file_unlocked()
+        data = {k: v for k, v in data.items() if v > now}
+        data[jti] = exp
+        _write_revocations_file_unlocked(data)
+        try:
+            mtime = REVOCATION_FILE.stat().st_mtime if REVOCATION_FILE.exists() else None
+        except Exception:
+            mtime = None
+        _revoked_jti_cache = data
+        _revoked_jti_mtime = mtime
+    return True
 
 
 async def verify_admin_session(
@@ -140,4 +265,5 @@ __all__ = [
     "create_admin_session_token",
     "verify_admin_session_token",
     "verify_admin_session",
+    "revoke_admin_session_token",
 ]

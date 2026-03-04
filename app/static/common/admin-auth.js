@@ -62,9 +62,21 @@ async function ensureApiKey() {
   return cachedApiKey;
 }
 
-function logout() {
-  clearStoredAppKey();
-  window.location.href = '/login';
+async function logout() {
+  try {
+    const token = await getStoredAppKey();
+    if (token) {
+      await fetch('/api/v1/admin/logout', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` }
+      });
+    }
+  } catch (e) {
+    // ignore logout network errors
+  } finally {
+    clearStoredAppKey();
+    window.location.href = '/login';
+  }
 }
 
 async function fetchStorageType() {
