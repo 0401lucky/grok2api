@@ -314,6 +314,7 @@ function mimeFromFilename(filename: string): string | null {
   if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
   if (lower.endsWith(".png")) return "image/png";
   if (lower.endsWith(".webp")) return "image/webp";
+  if (lower.endsWith(".gif")) return "image/gif";
   return null;
 }
 
@@ -652,7 +653,7 @@ function parseImageConcurrencyOrError(
 
 function parseAllowedImageMime(file: File): string | null {
   const byMime = normalizeImageMime(String(file.type || ""));
-  if (byMime === "image/png" || byMime === "image/jpeg" || byMime === "image/webp") return byMime;
+  if (byMime === "image/png" || byMime === "image/jpeg" || byMime === "image/webp" || byMime === "image/gif") return byMime;
   const byName = mimeFromFilename(String(file.name || ""));
   if (byName) return byName;
   return null;
@@ -2112,7 +2113,7 @@ openAiRoutes.post("/images/edits", async (c) => {
       const mime = parseAllowedImageMime(file);
       if (!mime) {
         return c.json(
-          openAiError("Unsupported image type. Supported: png, jpg, webp.", "invalid_image_type"),
+          openAiError("Unsupported image type. Supported: png, jpg, webp, gif.", "invalid_image_type"),
           400,
         );
       }

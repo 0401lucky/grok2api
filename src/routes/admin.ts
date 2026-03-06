@@ -1,4 +1,5 @@
-import { Hono } from "hono";
+﻿import { Hono } from "hono";
+import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import type { Env } from "../env";
 import { requireAdminAuth } from "../auth";
 import {
@@ -55,6 +56,21 @@ import {
 import { dbAll, dbFirst, dbRun } from "../db";
 import { nowMs } from "../utils/time";
 import { listUsageForDay, localDayString } from "../repo/apiKeyUsage";
+import { hasPasswordHash, hashPassword, verifyPassword } from "../utils/password";
+
+const ADMIN_SESSION_COOKIE = "g2a_admin_session";
+const ADMIN_SECRET_PLACEHOLDER = "__KEEP_EXISTING__";
+const LOGIN_WINDOW_MS = 10 * 60 * 1000;
+const LOGIN_LOCK_MS = 10 * 60 * 1000;
+const LOGIN_MAX_ATTEMPTS = 5;
+
+type LoginAttemptState = {
+  count: number;
+  firstAt: number;
+  lockedUntil: number;
+};
+
+const adminLoginAttempts = new Map<string, LoginAttemptState>();
 
 function jsonError(message: string, code: string): Record<string, unknown> {
   return { error: message, code };
@@ -74,6 +90,100 @@ function isWeakAdminPassword(password: string | undefined): boolean {
 function allowWeakAdminPassword(c: any): boolean {
   const raw = String(c.env.ALLOW_WEAK_ADMIN_PASSWORD ?? "").trim().toLowerCase();
   return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+}
+
+async function isWeakStoredAdminPassword(storedHash: string | undefined, legacyPlain: string | undefined): Promise<boolean> {
+  const plain = String(legacyPlain ?? "").trim();
+  if (!hasPasswordHash(storedHash)) return isWeakAdminPassword(plain);
+  for (const candidate of ["", "admin", "__CHANGE_ME__", "grok2api"]) {
+    if (await verifyPassword(candidate, storedHash, legacyPlain)) return true;
+  }
+  return false;
+}
+
+async function verifyStoredAdminPassword(storedHash: string | undefined, legacyPlain: string | undefined, input: string): Promise<boolean> {
+  return verifyPassword(input, storedHash, legacyPlain);
+}
+
+async function isPlaceholderBootstrap(storedHash: string | undefined, legacyPlain: string | undefined, input: string): Promise<boolean> {
+  if (String(input ?? "").trim() !== "__CHANGE_ME__") return false;
+  return verifyStoredAdminPassword(storedHash, legacyPlain, "__CHANGE_ME__");
+}
+
+function getAdminSessionCookieOptions(c: any): {
+  path: string;
+  httpOnly: boolean;
+  sameSite: "Lax";
+  secure: boolean;
+  maxAge: number;
+} {
+  const url = new URL(c.req.url);
+  return {
+    path: "/",
+    httpOnly: true,
+    sameSite: "Lax",
+    secure: url.protocol === "https:",
+    maxAge: 8 * 60 * 60,
+  };
+}
+
+function getClientIp(c: any): string {
+  const forwarded = String(c.req.header("CF-Connecting-IP") ?? c.req.header("X-Forwarded-For") ?? "").trim();
+  if (!forwarded) return "unknown";
+  return forwarded.split(",", 1)[0]?.trim() || "unknown";
+}
+
+function getLoginAttemptState(clientKey: string, now: number): LoginAttemptState {
+  const current = adminLoginAttempts.get(clientKey);
+  if (!current || current.lockedUntil <= now && now - current.firstAt > LOGIN_WINDOW_MS) {
+    const fresh = { count: 0, firstAt: now, lockedUntil: 0 };
+    adminLoginAttempts.set(clientKey, fresh);
+    return fresh;
+  }
+  return current;
+}
+
+function checkLoginThrottle(clientKey: string, now: number): number | null {
+  const state = getLoginAttemptState(clientKey, now);
+  if (state.lockedUntil > now) {
+    return Math.max(1, Math.ceil((state.lockedUntil - now) / 1000));
+  }
+  return null;
+}
+
+function recordLoginFailure(clientKey: string, now: number): number | null {
+  const state = getLoginAttemptState(clientKey, now);
+  if (now - state.firstAt > LOGIN_WINDOW_MS) {
+    state.count = 0;
+    state.firstAt = now;
+  }
+  state.count += 1;
+  if (state.count >= LOGIN_MAX_ATTEMPTS) {
+    state.lockedUntil = now + LOGIN_LOCK_MS;
+    return Math.max(1, Math.ceil(LOGIN_LOCK_MS / 1000));
+  }
+  adminLoginAttempts.set(clientKey, state);
+  return null;
+}
+
+function clearLoginFailure(clientKey: string): void {
+  adminLoginAttempts.delete(clientKey);
+}
+
+function extractCookieToken(c: any): string {
+  return String(getCookie(c, ADMIN_SESSION_COOKIE) ?? "").trim();
+}
+
+function isSensitiveConfigKey(section: string, key: string): boolean {
+  return (
+    (section === "app" && (key === "app_key" || key === "api_key")) ||
+    (section === "grok" && (key === "cf_clearance" || key === "wreq_emulation_nsfw")) ||
+    (section === "register" && (key === "admin_password" || key === "yescaptcha_key"))
+  );
+}
+
+function redactSecret(value: string | undefined): string {
+  return value ? ADMIN_SECRET_PLACEHOLDER : "";
 }
 
 function parseWsSubprotocols(raw: string | null): string[] {
@@ -100,7 +210,7 @@ function extractWsAdminSessionToken(c: any): string {
   if (protocols.length === 1 && protocols[0] !== "g2a-admin-session") {
     return protocols[0] ?? "";
   }
-  return "";
+  return extractCookieToken(c);
 }
 
 function isAllowedWsOrigin(c: any): boolean {
@@ -121,7 +231,7 @@ function isAllowedWsOrigin(c: any): boolean {
 }
 
 function validateTokenType(token_type: string): "sso" | "ssoSuper" {
-  if (token_type !== "sso" && token_type !== "ssoSuper") throw new Error("无效的Token类型");
+  if (token_type !== "sso" && token_type !== "ssoSuper") throw new Error("鏃犳晥鐨凾oken绫诲瀷");
   return token_type;
 }
 
@@ -172,10 +282,9 @@ async function clearKvCacheByType(
   env: Env,
   type: CacheType | null,
   batch = 200,
-  maxLoops = 20,
 ): Promise<number> {
   let deleted = 0;
-  for (let i = 0; i < maxLoops; i++) {
+  while (true) {
     const rows = await listOldestRows(env.DB, type, null, batch);
     if (!rows.length) break;
     const keys = rows.map((r) => r.key);
@@ -305,18 +414,52 @@ adminRoutes.post("/api/v1/admin/login", async (c) => {
     const settings = await getSettings(c.env);
     const username = String(body?.username ?? "").trim();
     const password = String(body?.password ?? "").trim();
+    const clientKey = getClientIp(c);
+    const now = Date.now();
+    const retryAfter = checkLoginThrottle(clientKey, now);
+    if (retryAfter) {
+      return c.json({ ...legacyErr("Too many login attempts. Please try again later."), retry_after: retryAfter }, 429);
+    }
 
-    if (isWeakAdminPassword(settings.global.admin_password) && !allowWeakAdminPassword(c)) {
+    const weakAdminPassword = await isWeakStoredAdminPassword(
+      settings.global.admin_password_hash,
+      settings.global.admin_password,
+    );
+    const placeholderBootstrap = await isPlaceholderBootstrap(
+      settings.global.admin_password_hash,
+      settings.global.admin_password,
+      password,
+    );
+    if (weakAdminPassword && !allowWeakAdminPassword(c) && !placeholderBootstrap) {
       return c.json(legacyErr("Admin password is weak or not initialized. Please set a strong password first."), 503);
     }
 
-    if (username !== settings.global.admin_username || password !== settings.global.admin_password) {
+    const passwordOk = await verifyStoredAdminPassword(
+      settings.global.admin_password_hash,
+      settings.global.admin_password,
+      password,
+    );
+    if (username !== settings.global.admin_username || !passwordOk) {
+      const lockedFor = recordLoginFailure(clientKey, now);
+      if (lockedFor) {
+        return c.json({ ...legacyErr("Too many login attempts. Please try again later."), retry_after: lockedFor }, 429);
+      }
       return c.json(legacyErr("Invalid username or password"), 401);
     }
 
-    // Return a short-lived admin session token as "api_key" (frontend expects this name).
+    clearLoginFailure(clientKey);
+    if (!settings.global.admin_password_hash && settings.global.admin_password) {
+      await saveSettings(c.env, {
+        global_config: {
+          admin_password_hash: await hashPassword(settings.global.admin_password),
+          admin_password: "",
+        },
+      });
+    }
+
     const token = await createAdminSession(c.env.DB);
-    return c.json(legacyOk({ api_key: token }));
+    setCookie(c, ADMIN_SESSION_COOKIE, token, getAdminSessionCookieOptions(c));
+    return c.json({ status: "success", password_reset_required: weakAdminPassword && placeholderBootstrap });
   } catch (e) {
     return c.json(legacyErr(`Login error: ${e instanceof Error ? e.message : String(e)}`), 500);
   }
@@ -335,9 +478,11 @@ adminRoutes.get("/api/v1/admin/config", requireAdminAuth, async (c) => {
       .filter(Boolean);
     return c.json({
       app: {
-        api_key: settings.grok.api_key ?? "",
+        api_key: redactSecret(settings.grok.api_key),
+        api_key_set: Boolean(settings.grok.api_key),
         admin_username: settings.global.admin_username ?? "",
-        app_key: settings.global.admin_password ?? "",
+        app_key: redactSecret(settings.global.admin_password_hash || settings.global.admin_password),
+        app_key_set: Boolean(settings.global.admin_password_hash || settings.global.admin_password),
         app_url: settings.global.base_url ?? "",
         image_format: settings.global.image_mode ?? "url",
         video_format: "url",
@@ -352,8 +497,10 @@ adminRoutes.get("/api/v1/admin/config", requireAdminAuth, async (c) => {
         timeout: Number(settings.grok.stream_total_timeout ?? 600),
         base_proxy_url: String(settings.grok.proxy_url ?? ""),
         asset_proxy_url: String(settings.grok.cache_proxy_url ?? ""),
-        cf_clearance: String(settings.grok.cf_clearance ?? ""),
-        wreq_emulation_nsfw: String(settings.grok.wreq_emulation_nsfw ?? ""),
+        cf_clearance: redactSecret(String(settings.grok.cf_clearance ?? "")),
+        cf_clearance_set: Boolean(settings.grok.cf_clearance),
+        wreq_emulation_nsfw: redactSecret(String(settings.grok.wreq_emulation_nsfw ?? "")),
+        wreq_emulation_nsfw_set: Boolean(settings.grok.wreq_emulation_nsfw),
         max_retry: 3,
         retry_status_codes: Array.isArray(settings.grok.retry_status_codes) ? settings.grok.retry_status_codes : [401, 429, 403],
         image_generation_method: normalizeImageGenerationMethod(
@@ -384,6 +531,23 @@ adminRoutes.get("/api/v1/admin/config", requireAdminAuth, async (c) => {
         nsfw_batch_size: Number(settings.performance.nsfw_batch_size ?? 50),
         nsfw_max_tokens: Number(settings.performance.nsfw_max_tokens ?? 1000),
       },
+      register: {
+        admin_password: redactSecret(settings.register.admin_password),
+        admin_password_set: Boolean(settings.register.admin_password),
+        yescaptcha_key: redactSecret(settings.register.yescaptcha_key),
+        yescaptcha_key_set: Boolean(settings.register.yescaptcha_key),
+        worker_domain: settings.register.worker_domain ?? "",
+        email_domain: settings.register.email_domain ?? "",
+        solver_url: settings.register.solver_url ?? "",
+        solver_browser_type: settings.register.solver_browser_type ?? "camoufox",
+        solver_threads: Number(settings.register.solver_threads ?? 5),
+        register_threads: Number(settings.register.register_threads ?? 10),
+        default_count: Number(settings.register.default_count ?? 100),
+        auto_start_solver: Boolean(settings.register.auto_start_solver),
+        solver_debug: Boolean(settings.register.solver_debug),
+        max_errors: Number(settings.register.max_errors ?? 0),
+        max_runtime_minutes: Number(settings.register.max_runtime_minutes ?? 0),
+      },
     });
   } catch (e) {
     return c.json(legacyErr(`Get config failed: ${e instanceof Error ? e.message : String(e)}`), 500);
@@ -398,17 +562,28 @@ adminRoutes.post("/api/v1/admin/config", requireAdminAuth, async (c) => {
     const tokenCfg = (body && typeof body === "object" ? body.token : null) as any;
     const cacheCfg = (body && typeof body === "object" ? body.cache : null) as any;
     const performanceCfg = (body && typeof body === "object" ? body.performance : null) as any;
+    const registerCfg = (body && typeof body === "object" ? body.register : null) as any;
 
     const global_config: any = {};
     const grok_config: any = {};
     const token_config: any = {};
     const cache_config: any = {};
     const performance_config: any = {};
+    const register_config: any = {};
 
     if (appCfg && typeof appCfg === "object") {
-      if (typeof appCfg.api_key === "string") grok_config.api_key = appCfg.api_key.trim();
+      if (typeof appCfg.api_key === "string") {
+        const value = appCfg.api_key.trim();
+        if (value && value !== ADMIN_SECRET_PLACEHOLDER) grok_config.api_key = value;
+      }
       if (typeof appCfg.admin_username === "string") global_config.admin_username = appCfg.admin_username.trim();
-      if (typeof appCfg.app_key === "string") global_config.admin_password = appCfg.app_key.trim();
+      if (typeof appCfg.app_key === "string") {
+        const value = appCfg.app_key.trim();
+        if (value && value !== ADMIN_SECRET_PLACEHOLDER) {
+          global_config.admin_password_hash = await hashPassword(value);
+          global_config.admin_password = "";
+        }
+      }
       if (typeof appCfg.app_url === "string") global_config.base_url = appCfg.app_url.trim();
       if (appCfg.image_format === "url" || appCfg.image_format === "base64" || appCfg.image_format === "b64_json")
         global_config.image_mode = appCfg.image_format;
@@ -417,8 +592,14 @@ adminRoutes.post("/api/v1/admin/config", requireAdminAuth, async (c) => {
     if (grokCfg && typeof grokCfg === "object") {
       if (typeof grokCfg.base_proxy_url === "string") grok_config.proxy_url = grokCfg.base_proxy_url.trim();
       if (typeof grokCfg.asset_proxy_url === "string") grok_config.cache_proxy_url = grokCfg.asset_proxy_url.trim();
-      if (typeof grokCfg.cf_clearance === "string") grok_config.cf_clearance = grokCfg.cf_clearance.trim();
-      if (typeof grokCfg.wreq_emulation_nsfw === "string") grok_config.wreq_emulation_nsfw = grokCfg.wreq_emulation_nsfw.trim();
+      if (typeof grokCfg.cf_clearance === "string") {
+        const value = grokCfg.cf_clearance.trim();
+        if (value && value !== ADMIN_SECRET_PLACEHOLDER) grok_config.cf_clearance = value;
+      }
+      if (typeof grokCfg.wreq_emulation_nsfw === "string") {
+        const value = grokCfg.wreq_emulation_nsfw.trim();
+        if (value && value !== ADMIN_SECRET_PLACEHOLDER) grok_config.wreq_emulation_nsfw = value;
+      }
       if (typeof grokCfg.filter_tags === "string") {
         grok_config.filtered_tags = grokCfg.filter_tags;
       } else if (Array.isArray(grokCfg.filter_tags)) {
@@ -476,7 +657,29 @@ adminRoutes.post("/api/v1/admin/config", requireAdminAuth, async (c) => {
       }
     }
 
-    await saveSettings(c.env, { global_config, grok_config, token_config, cache_config, performance_config });
+    if (registerCfg && typeof registerCfg === "object") {
+      if (typeof registerCfg.worker_domain === "string") register_config.worker_domain = registerCfg.worker_domain.trim();
+      if (typeof registerCfg.email_domain === "string") register_config.email_domain = registerCfg.email_domain.trim();
+      if (typeof registerCfg.admin_password === "string") {
+        const value = registerCfg.admin_password.trim();
+        if (value && value !== ADMIN_SECRET_PLACEHOLDER) register_config.admin_password = value;
+      }
+      if (typeof registerCfg.yescaptcha_key === "string") {
+        const value = registerCfg.yescaptcha_key.trim();
+        if (value && value !== ADMIN_SECRET_PLACEHOLDER) register_config.yescaptcha_key = value;
+      }
+      if (typeof registerCfg.solver_url === "string") register_config.solver_url = registerCfg.solver_url.trim();
+      if (typeof registerCfg.solver_browser_type === "string") register_config.solver_browser_type = registerCfg.solver_browser_type.trim();
+      if (Number.isFinite(Number(registerCfg.solver_threads))) register_config.solver_threads = Math.max(1, Math.floor(Number(registerCfg.solver_threads)));
+      if (Number.isFinite(Number(registerCfg.register_threads))) register_config.register_threads = Math.max(1, Math.floor(Number(registerCfg.register_threads)));
+      if (Number.isFinite(Number(registerCfg.default_count))) register_config.default_count = Math.max(1, Math.floor(Number(registerCfg.default_count)));
+      if (typeof registerCfg.auto_start_solver === "boolean") register_config.auto_start_solver = registerCfg.auto_start_solver;
+      if (typeof registerCfg.solver_debug === "boolean") register_config.solver_debug = registerCfg.solver_debug;
+      if (Number.isFinite(Number(registerCfg.max_errors))) register_config.max_errors = Math.max(0, Math.floor(Number(registerCfg.max_errors)));
+      if (Number.isFinite(Number(registerCfg.max_runtime_minutes))) register_config.max_runtime_minutes = Math.max(0, Math.floor(Number(registerCfg.max_runtime_minutes)));
+    }
+
+    await saveSettings(c.env, { global_config, grok_config, token_config, cache_config, performance_config, register_config });
     return c.json(legacyOk({ message: "配置已更新" }));
   } catch (e) {
     return c.json(legacyErr(`Update config failed: ${e instanceof Error ? e.message : String(e)}`), 500);
@@ -804,7 +1007,7 @@ adminRoutes.post("/api/v1/admin/tokens", requireAdminAuth, async (c) => {
     }
 
     if (stmts.length) await c.env.DB.batch(stmts);
-    return c.json(legacyOk({ message: "Token 已更新" }));
+    return c.json(legacyOk({ message: "配置已更新" }));
   } catch (e) {
     return c.json(legacyErr(`Update tokens failed: ${e instanceof Error ? e.message : String(e)}`), 500);
   }
@@ -870,8 +1073,9 @@ adminRoutes.post("/api/v1/admin/tokens/refresh", requireAdminAuth, async (c) => 
 
 adminRoutes.post("/api/v1/admin/logout", requireAdminAuth, async (c) => {
   try {
-    const token = parseBearer(c.req.header("Authorization") ?? null);
+    const token = parseBearer(c.req.header("Authorization") ?? null) ?? (extractCookieToken(c) || null);
     if (token) await deleteAdminSession(c.env.DB, token);
+    deleteCookie(c, ADMIN_SESSION_COOKIE, { path: "/" });
     return c.json(legacyOk({ message: "登出成功" }));
   } catch (e) {
     return c.json(legacyErr(`Logout error: ${e instanceof Error ? e.message : String(e)}`), 500);
@@ -995,7 +1199,7 @@ adminRoutes.post("/api/v1/admin/tokens/nsfw/enable", requireAdminAuth, async (c)
       results: resultsOut,
     };
     if (truncated) {
-      resp.warning = `数量超出限制，仅处理前 ${maxTokens} 个（共 ${originalCount} 个）`;
+      resp.warning = `鏁伴噺瓒呭嚭闄愬埗锛屼粎澶勭悊鍓?${maxTokens} 涓紙鍏?${originalCount} 涓級`;
     }
     return c.json(resp);
   } catch (e) {
@@ -1361,17 +1565,43 @@ adminRoutes.post("/api/login", async (c) => {
   try {
     const body = (await c.req.json()) as { username?: string; password?: string };
     const settings = await getSettings(c.env);
+    const clientKey = getClientIp(c);
+    const now = Date.now();
+    const retryAfter = checkLoginThrottle(clientKey, now);
+    if (retryAfter) {
+      return c.json({ success: false, message: "登录过于频繁，请稍后再试", retry_after: retryAfter }, 429);
+    }
 
-    if (isWeakAdminPassword(settings.global.admin_password) && !allowWeakAdminPassword(c)) {
+    const weakAdminPassword = await isWeakStoredAdminPassword(
+      settings.global.admin_password_hash,
+      settings.global.admin_password,
+    );
+    const placeholderBootstrap = await isPlaceholderBootstrap(
+      settings.global.admin_password_hash,
+      settings.global.admin_password,
+      String(body.password ?? ""),
+    );
+    if (weakAdminPassword && !allowWeakAdminPassword(c) && !placeholderBootstrap) {
       return c.json({ success: false, message: "管理员密码过弱或未初始化，请先设置强密码" }, 503);
     }
 
-    if (body.username !== settings.global.admin_username || body.password !== settings.global.admin_password) {
-      return c.json({ success: false, message: "用户名或密码错误" });
+    const passwordOk = await verifyStoredAdminPassword(
+      settings.global.admin_password_hash,
+      settings.global.admin_password,
+      String(body.password ?? ""),
+    );
+    if (body.username !== settings.global.admin_username || !passwordOk) {
+      const lockedFor = recordLoginFailure(clientKey, now);
+      if (lockedFor) {
+        return c.json({ success: false, message: "登录过于频繁，请稍后再试", retry_after: lockedFor }, 429);
+      }
+      return c.json({ success: false, message: "用户名或密码错误" }, 401);
     }
 
+    clearLoginFailure(clientKey);
     const token = await createAdminSession(c.env.DB);
-    return c.json({ success: true, token, message: "登录成功" });
+    setCookie(c, ADMIN_SESSION_COOKIE, token, getAdminSessionCookieOptions(c));
+    return c.json({ success: true, message: "登录成功", password_reset_required: weakAdminPassword && placeholderBootstrap });
   } catch (e) {
     return c.json(jsonError(`登录失败: ${e instanceof Error ? e.message : String(e)}`, "LOGIN_ERROR"), 500);
   }
@@ -1379,8 +1609,9 @@ adminRoutes.post("/api/login", async (c) => {
 
 adminRoutes.post("/api/logout", requireAdminAuth, async (c) => {
   try {
-    const token = parseBearer(c.req.header("Authorization") ?? null);
+    const token = parseBearer(c.req.header("Authorization") ?? null) ?? (extractCookieToken(c) || null);
     if (token) await deleteAdminSession(c.env.DB, token);
+    deleteCookie(c, ADMIN_SESSION_COOKIE, { path: "/" });
     return c.json({ success: true, message: "登出成功" });
   } catch (e) {
     return c.json(jsonError(`登出失败: ${e instanceof Error ? e.message : String(e)}`, "LOGOUT_ERROR"), 500);
@@ -1390,19 +1621,57 @@ adminRoutes.post("/api/logout", requireAdminAuth, async (c) => {
 adminRoutes.get("/api/settings", requireAdminAuth, async (c) => {
   try {
     const settings = await getSettings(c.env);
-    return c.json({ success: true, data: settings });
+    return c.json({
+      success: true,
+      data: {
+        ...settings,
+        global: {
+          ...settings.global,
+          admin_password: redactSecret(settings.global.admin_password_hash || settings.global.admin_password),
+        },
+        grok: {
+          ...settings.grok,
+          api_key: redactSecret(settings.grok.api_key),
+          cf_clearance: redactSecret(settings.grok.cf_clearance),
+          wreq_emulation_nsfw: redactSecret(settings.grok.wreq_emulation_nsfw),
+        },
+        register: {
+          ...settings.register,
+          admin_password: redactSecret(settings.register.admin_password),
+          yescaptcha_key: redactSecret(settings.register.yescaptcha_key),
+        },
+      },
+    });
   } catch (e) {
-    return c.json(jsonError(`获取失败: ${e instanceof Error ? e.message : String(e)}`, "GET_SETTINGS_ERROR"), 500);
+    return c.json(jsonError(`鑾峰彇澶辫触: ${e instanceof Error ? e.message : String(e)}`, "GET_SETTINGS_ERROR"), 500);
   }
 });
 
 adminRoutes.post("/api/settings", requireAdminAuth, async (c) => {
   try {
     const body = (await c.req.json()) as { global_config?: any; grok_config?: any };
-    await saveSettings(c.env, { global_config: body.global_config, grok_config: body.grok_config });
-    return c.json({ success: true, message: "配置更新成功" });
+    const global_config = { ...(body.global_config || {}) };
+    const grok_config = { ...(body.grok_config || {}) };
+    if (typeof global_config.admin_password === 'string') {
+      const value = global_config.admin_password.trim();
+      if (value && value !== ADMIN_SECRET_PLACEHOLDER) {
+        global_config.admin_password_hash = await hashPassword(value);
+        global_config.admin_password = '';
+      } else {
+        delete global_config.admin_password;
+      }
+    }
+    for (const key of ['api_key', 'cf_clearance', 'wreq_emulation_nsfw']) {
+      if (typeof grok_config[key] === 'string') {
+        const value = grok_config[key].trim();
+        if (!value || value === ADMIN_SECRET_PLACEHOLDER) delete grok_config[key];
+        else grok_config[key] = value;
+      }
+    }
+    await saveSettings(c.env, { global_config, grok_config });
+    return c.json({ success: true, message: "閰嶇疆鏇存柊鎴愬姛" });
   } catch (e) {
-    return c.json(jsonError(`更新失败: ${e instanceof Error ? e.message : String(e)}`, "UPDATE_SETTINGS_ERROR"), 500);
+    return c.json(jsonError(`鏇存柊澶辫触: ${e instanceof Error ? e.message : String(e)}`, "UPDATE_SETTINGS_ERROR"), 500);
   }
 });
 
@@ -1416,7 +1685,7 @@ adminRoutes.get("/api/tokens", requireAdminAuth, async (c) => {
     const infos = rows.map(tokenRowToInfo);
     return c.json({ success: true, data: infos, total: infos.length });
   } catch (e) {
-    return c.json(jsonError(`获取失败: ${e instanceof Error ? e.message : String(e)}`, "TOKENS_LIST_ERROR"), 500);
+    return c.json(jsonError(`鑾峰彇澶辫触: ${e instanceof Error ? e.message : String(e)}`, "TOKENS_LIST_ERROR"), 500);
   }
 });
 
@@ -1426,9 +1695,9 @@ adminRoutes.post("/api/tokens/add", requireAdminAuth, async (c) => {
     const token_type = validateTokenType(String(body.token_type ?? ""));
     const tokens = Array.isArray(body.tokens) ? body.tokens : [];
     const count = await addTokens(c.env.DB, tokens, token_type);
-    return c.json({ success: true, message: `添加成功(${count})` });
+    return c.json({ success: true, message: `娣诲姞鎴愬姛(${count})` });
   } catch (e) {
-    return c.json(jsonError(`添加失败: ${e instanceof Error ? e.message : String(e)}`, "TOKENS_ADD_ERROR"), 500);
+    return c.json(jsonError(`娣诲姞澶辫触: ${e instanceof Error ? e.message : String(e)}`, "TOKENS_ADD_ERROR"), 500);
   }
 });
 
@@ -1438,9 +1707,9 @@ adminRoutes.post("/api/tokens/delete", requireAdminAuth, async (c) => {
     const token_type = validateTokenType(String(body.token_type ?? ""));
     const tokens = Array.isArray(body.tokens) ? body.tokens : [];
     const deleted = await deleteTokens(c.env.DB, tokens, token_type);
-    return c.json({ success: true, message: `删除成功(${deleted})` });
+    return c.json({ success: true, message: `鍒犻櫎鎴愬姛(${deleted})` });
   } catch (e) {
-    return c.json(jsonError(`删除失败: ${e instanceof Error ? e.message : String(e)}`, "TOKENS_DELETE_ERROR"), 500);
+    return c.json(jsonError(`鍒犻櫎澶辫触: ${e instanceof Error ? e.message : String(e)}`, "TOKENS_DELETE_ERROR"), 500);
   }
 });
 
@@ -1451,9 +1720,9 @@ adminRoutes.post("/api/tokens/tags", requireAdminAuth, async (c) => {
     const token = String(body.token ?? "");
     const tags = Array.isArray(body.tags) ? body.tags : [];
     await updateTokenTags(c.env.DB, token, token_type, tags);
-    return c.json({ success: true, message: "标签更新成功", tags });
+    return c.json({ success: true, message: "鏍囩鏇存柊鎴愬姛", tags });
   } catch (e) {
-    return c.json(jsonError(`更新失败: ${e instanceof Error ? e.message : String(e)}`, "UPDATE_TAGS_ERROR"), 500);
+    return c.json(jsonError(`鏇存柊澶辫触: ${e instanceof Error ? e.message : String(e)}`, "UPDATE_TAGS_ERROR"), 500);
   }
 });
 
@@ -1464,9 +1733,9 @@ adminRoutes.post("/api/tokens/note", requireAdminAuth, async (c) => {
     const token = String(body.token ?? "");
     const note = String(body.note ?? "");
     await updateTokenNote(c.env.DB, token, token_type, note);
-    return c.json({ success: true, message: "备注更新成功", note });
+    return c.json({ success: true, message: "澶囨敞鏇存柊鎴愬姛", note });
   } catch (e) {
-    return c.json(jsonError(`更新失败: ${e instanceof Error ? e.message : String(e)}`, "UPDATE_NOTE_ERROR"), 500);
+    return c.json(jsonError(`鏇存柊澶辫触: ${e instanceof Error ? e.message : String(e)}`, "UPDATE_NOTE_ERROR"), 500);
   }
 });
 
@@ -1475,7 +1744,7 @@ adminRoutes.get("/api/tokens/tags/all", requireAdminAuth, async (c) => {
     const tags = await getAllTags(c.env.DB);
     return c.json({ success: true, data: tags });
   } catch (e) {
-    return c.json(jsonError(`获取失败: ${e instanceof Error ? e.message : String(e)}`, "GET_TAGS_ERROR"), 500);
+    return c.json(jsonError(`鑾峰彇澶辫触: ${e instanceof Error ? e.message : String(e)}`, "GET_TAGS_ERROR"), 500);
   }
 });
 
@@ -1506,7 +1775,7 @@ adminRoutes.post("/api/tokens/test", requireAdminAuth, async (c) => {
       });
       return c.json({
         success: true,
-        message: "Token有效",
+        message: "Token鏈夋晥",
         data: {
           valid: true,
           remaining_queries: typeof remaining === "number" ? remaining : -1,
@@ -1516,21 +1785,21 @@ adminRoutes.post("/api/tokens/test", requireAdminAuth, async (c) => {
       });
     }
 
-    // Fallback：根据本地状态判断原因
+    // Fallback锛氭牴鎹湰鍦扮姸鎬佸垽鏂師鍥?
     const rows = await listTokens(c.env.DB);
     const row = rows.find((r) => r.token === token && r.token_type === token_type);
     if (!row) {
-      return c.json({ success: false, message: "Token数据异常", data: { valid: false, error_type: "unknown" } });
+      return c.json({ success: false, message: "Token鏁版嵁寮傚父", data: { valid: false, error_type: "unknown" } });
     }
     const now = Date.now();
     if (row.status === "expired") {
-      return c.json({ success: false, message: "Token已失效", data: { valid: false, error_type: "expired", error_code: 401 } });
+      return c.json({ success: false, message: "Token 已失效", data: { valid: false, error_type: "expired", error_code: 401 } });
     }
     if (row.cooldown_until && row.cooldown_until > now) {
       const remaining = Math.floor((row.cooldown_until - now + 999) / 1000);
       return c.json({
         success: false,
-        message: "Token处于冷却中",
+        message: "Token 正在冷却中",
         data: { valid: false, error_type: "cooldown", error_code: 429, cooldown_remaining: remaining },
       });
     }
@@ -1541,17 +1810,17 @@ adminRoutes.post("/api/tokens/test", requireAdminAuth, async (c) => {
     if (exhausted) {
       return c.json({
         success: false,
-        message: "Token额度耗尽",
+        message: "Token棰濆害鑰楀敖",
         data: { valid: false, error_type: "exhausted", error_code: "quota_exhausted" },
       });
     }
     return c.json({
       success: false,
-      message: "服务器被 block 或网络错误",
+      message: "服务被上游阻止或网络异常",
       data: { valid: false, error_type: "blocked", error_code: 403 },
     });
   } catch (e) {
-    return c.json(jsonError(`测试失败: ${e instanceof Error ? e.message : String(e)}`, "TEST_TOKEN_ERROR"), 500);
+    return c.json(jsonError(`娴嬭瘯澶辫触: ${e instanceof Error ? e.message : String(e)}`, "TEST_TOKEN_ERROR"), 500);
   }
 });
 
@@ -1604,7 +1873,7 @@ adminRoutes.post("/api/tokens/refresh-all", requireAdminAuth, async (c) => {
 
     return c.json({ success: true, message: "刷新任务已启动", data: { started: true } });
   } catch (e) {
-    return c.json(jsonError(`刷新失败: ${e instanceof Error ? e.message : String(e)}`, "REFRESH_ALL_ERROR"), 500);
+    return c.json(jsonError(`鍒锋柊澶辫触: ${e instanceof Error ? e.message : String(e)}`, "REFRESH_ALL_ERROR"), 500);
   }
 });
 
@@ -1613,7 +1882,7 @@ adminRoutes.get("/api/tokens/refresh-progress", requireAdminAuth, async (c) => {
     const progress = await getRefreshProgress(c.env.DB);
     return c.json({ success: true, data: progress });
   } catch (e) {
-    return c.json(jsonError(`获取失败: ${e instanceof Error ? e.message : String(e)}`, "GET_PROGRESS_ERROR"), 500);
+    return c.json(jsonError(`鑾峰彇澶辫触: ${e instanceof Error ? e.message : String(e)}`, "GET_PROGRESS_ERROR"), 500);
   }
 });
 
@@ -1659,7 +1928,7 @@ adminRoutes.get("/api/stats", requireAdminAuth, async (c) => {
     const superStats = calc("ssoSuper");
     return c.json({ success: true, data: { normal, super: superStats, total: normal.total + superStats.total } });
   } catch (e) {
-    return c.json(jsonError(`获取失败: ${e instanceof Error ? e.message : String(e)}`, "STATS_ERROR"), 500);
+    return c.json(jsonError(`鑾峰彇澶辫触: ${e instanceof Error ? e.message : String(e)}`, "STATS_ERROR"), 500);
   }
 });
 
@@ -1668,7 +1937,7 @@ adminRoutes.get("/api/request-stats", requireAdminAuth, async (c) => {
     const stats = await getRequestStats(c.env.DB);
     return c.json({ success: true, data: stats });
   } catch (e) {
-    return c.json(jsonError(`获取失败: ${e instanceof Error ? e.message : String(e)}`, "REQUEST_STATS_ERROR"), 500);
+    return c.json(jsonError(`鑾峰彇澶辫触: ${e instanceof Error ? e.message : String(e)}`, "REQUEST_STATS_ERROR"), 500);
   }
 });
 
@@ -1709,7 +1978,7 @@ adminRoutes.get("/api/v1/admin/keys", requireAdminAuth, async (c) => {
 
     return c.json({ success: true, data });
   } catch (e) {
-    return c.json(jsonError(`获取失败: ${e instanceof Error ? e.message : String(e)}`, "ADMIN_KEYS_LIST_ERROR"), 500);
+    return c.json(jsonError(`鑾峰彇澶辫触: ${e instanceof Error ? e.message : String(e)}`, "ADMIN_KEYS_LIST_ERROR"), 500);
   }
 });
 
@@ -1737,7 +2006,7 @@ adminRoutes.post("/api/v1/admin/keys", requireAdminAuth, async (c) => {
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     if (/UNIQUE|constraint/i.test(msg)) return c.json(jsonError("Key 已存在", "KEY_EXISTS"), 400);
-    return c.json(jsonError(`创建失败: ${msg}`, "ADMIN_KEYS_CREATE_ERROR"), 500);
+    return c.json(jsonError(`鍒涘缓澶辫触: ${msg}`, "ADMIN_KEYS_CREATE_ERROR"), 500);
   }
 });
 
@@ -1778,7 +2047,7 @@ adminRoutes.post("/api/v1/admin/keys/update", requireAdminAuth, async (c) => {
 
     return c.json({ success: true });
   } catch (e) {
-    return c.json(jsonError(`更新失败: ${e instanceof Error ? e.message : String(e)}`, "ADMIN_KEYS_UPDATE_ERROR"), 500);
+    return c.json(jsonError(`鏇存柊澶辫触: ${e instanceof Error ? e.message : String(e)}`, "ADMIN_KEYS_UPDATE_ERROR"), 500);
   }
 });
 
@@ -1790,7 +2059,7 @@ adminRoutes.post("/api/v1/admin/keys/delete", requireAdminAuth, async (c) => {
     const ok = await deleteApiKey(c.env.DB, key);
     return c.json(ok ? { success: true } : jsonError("Key not found", "NOT_FOUND"), ok ? 200 : 404);
   } catch (e) {
-    return c.json(jsonError(`删除失败: ${e instanceof Error ? e.message : String(e)}`, "ADMIN_KEYS_DELETE_ERROR"), 500);
+    return c.json(jsonError(`鍒犻櫎澶辫触: ${e instanceof Error ? e.message : String(e)}`, "ADMIN_KEYS_DELETE_ERROR"), 500);
   }
 });
 
@@ -1803,7 +2072,7 @@ adminRoutes.get("/api/keys", requireAdminAuth, async (c) => {
     const data = keys.map((k) => ({ ...k, display_key: displayKey(k.key) }));
     return c.json({ success: true, data, global_key_set: globalKeySet });
   } catch (e) {
-    return c.json(jsonError(`获取失败: ${e instanceof Error ? e.message : String(e)}`, "KEYS_LIST_ERROR"), 500);
+    return c.json(jsonError(`鑾峰彇澶辫触: ${e instanceof Error ? e.message : String(e)}`, "KEYS_LIST_ERROR"), 500);
   }
 });
 
@@ -1811,11 +2080,11 @@ adminRoutes.post("/api/keys/add", requireAdminAuth, async (c) => {
   try {
     const body = (await c.req.json()) as { name?: string };
     const name = String(body.name ?? "").trim();
-    if (!name) return c.json({ success: false, message: "name不能为空" });
+    if (!name) return c.json({ success: false, message: "name涓嶈兘涓虹┖" });
     const row = await addApiKey(c.env.DB, name);
-    return c.json({ success: true, data: row, message: "Key创建成功" });
+    return c.json({ success: true, data: row, message: "Key鍒涘缓鎴愬姛" });
   } catch (e) {
-    return c.json(jsonError(`添加失败: ${e instanceof Error ? e.message : String(e)}`, "KEY_ADD_ERROR"), 500);
+    return c.json(jsonError(`娣诲姞澶辫触: ${e instanceof Error ? e.message : String(e)}`, "KEY_ADD_ERROR"), 500);
   }
 });
 
@@ -1824,11 +2093,11 @@ adminRoutes.post("/api/keys/batch-add", requireAdminAuth, async (c) => {
     const body = (await c.req.json()) as { name_prefix?: string; count?: number };
     const prefix = String(body.name_prefix ?? "").trim();
     const count = Math.max(1, Math.min(100, Number(body.count ?? 1)));
-    if (!prefix) return c.json({ success: false, message: "name_prefix不能为空" });
+    if (!prefix) return c.json({ success: false, message: "name_prefix涓嶈兘涓虹┖" });
     const rows = await batchAddApiKeys(c.env.DB, prefix, count);
-    return c.json({ success: true, data: rows, message: `成功创建 ${rows.length} 个Key` });
+    return c.json({ success: true, data: rows, message: `鎴愬姛鍒涘缓 ${rows.length} 涓狵ey` });
   } catch (e) {
-    return c.json(jsonError(`批量添加失败: ${e instanceof Error ? e.message : String(e)}`, "KEY_BATCH_ADD_ERROR"), 500);
+    return c.json(jsonError(`鎵归噺娣诲姞澶辫触: ${e instanceof Error ? e.message : String(e)}`, "KEY_BATCH_ADD_ERROR"), 500);
   }
 });
 
@@ -1836,11 +2105,11 @@ adminRoutes.post("/api/keys/delete", requireAdminAuth, async (c) => {
   try {
     const body = (await c.req.json()) as { key?: string };
     const key = String(body.key ?? "");
-    if (!key) return c.json({ success: false, message: "Key不能为空" });
+    if (!key) return c.json({ success: false, message: "Key涓嶈兘涓虹┖" });
     const ok = await deleteApiKey(c.env.DB, key);
-    return c.json(ok ? { success: true, message: "Key删除成功" } : { success: false, message: "Key不存在" });
+    return c.json(ok ? { success: true, message: "Key 删除成功" } : { success: false, message: "Key 不存在" });
   } catch (e) {
-    return c.json(jsonError(`删除失败: ${e instanceof Error ? e.message : String(e)}`, "KEY_DELETE_ERROR"), 500);
+    return c.json(jsonError(`鍒犻櫎澶辫触: ${e instanceof Error ? e.message : String(e)}`, "KEY_DELETE_ERROR"), 500);
   }
 });
 
@@ -1849,9 +2118,9 @@ adminRoutes.post("/api/keys/batch-delete", requireAdminAuth, async (c) => {
     const body = (await c.req.json()) as { keys?: string[] };
     const keys = Array.isArray(body.keys) ? body.keys : [];
     const deleted = await batchDeleteApiKeys(c.env.DB, keys);
-    return c.json({ success: true, message: `成功删除 ${deleted} 个Key` });
+    return c.json({ success: true, message: `鎴愬姛鍒犻櫎 ${deleted} 涓狵ey` });
   } catch (e) {
-    return c.json(jsonError(`批量删除失败: ${e instanceof Error ? e.message : String(e)}`, "KEY_BATCH_DELETE_ERROR"), 500);
+    return c.json(jsonError(`鎵归噺鍒犻櫎澶辫触: ${e instanceof Error ? e.message : String(e)}`, "KEY_BATCH_DELETE_ERROR"), 500);
   }
 });
 
@@ -1860,9 +2129,9 @@ adminRoutes.post("/api/keys/status", requireAdminAuth, async (c) => {
     const body = (await c.req.json()) as { key?: string; is_active?: boolean };
     const key = String(body.key ?? "");
     const ok = await updateApiKeyStatus(c.env.DB, key, Boolean(body.is_active));
-    return c.json(ok ? { success: true, message: "状态更新成功" } : { success: false, message: "Key不存在" });
+    return c.json(ok ? { success: true, message: "状态更新成功" } : { success: false, message: "Key 不存在" });
   } catch (e) {
-    return c.json(jsonError(`更新失败: ${e instanceof Error ? e.message : String(e)}`, "KEY_STATUS_ERROR"), 500);
+    return c.json(jsonError(`鏇存柊澶辫触: ${e instanceof Error ? e.message : String(e)}`, "KEY_STATUS_ERROR"), 500);
   }
 });
 
@@ -1871,9 +2140,9 @@ adminRoutes.post("/api/keys/batch-status", requireAdminAuth, async (c) => {
     const body = (await c.req.json()) as { keys?: string[]; is_active?: boolean };
     const keys = Array.isArray(body.keys) ? body.keys : [];
     const updated = await batchUpdateApiKeyStatus(c.env.DB, keys, Boolean(body.is_active));
-    return c.json({ success: true, message: `成功更新 ${updated} 个Key 状态` });
+    return c.json({ success: true, message: `成功更新 ${updated} 个 Key 状态` });
   } catch (e) {
-    return c.json(jsonError(`批量更新失败: ${e instanceof Error ? e.message : String(e)}`, "KEY_BATCH_STATUS_ERROR"), 500);
+    return c.json(jsonError(`鎵归噺鏇存柊澶辫触: ${e instanceof Error ? e.message : String(e)}`, "KEY_BATCH_STATUS_ERROR"), 500);
   }
 });
 
@@ -1881,9 +2150,9 @@ adminRoutes.post("/api/keys/name", requireAdminAuth, async (c) => {
   try {
     const body = (await c.req.json()) as { key?: string; name?: string };
     const ok = await updateApiKeyName(c.env.DB, String(body.key ?? ""), String(body.name ?? ""));
-    return c.json(ok ? { success: true, message: "备注更新成功" } : { success: false, message: "Key不存在" });
+    return c.json(ok ? { success: true, message: "备注更新成功" } : { success: false, message: "Key 不存在" });
   } catch (e) {
-    return c.json(jsonError(`更新失败: ${e instanceof Error ? e.message : String(e)}`, "KEY_NAME_ERROR"), 500);
+    return c.json(jsonError(`鏇存柊澶辫触: ${e instanceof Error ? e.message : String(e)}`, "KEY_NAME_ERROR"), 500);
   }
 });
 
@@ -1895,7 +2164,7 @@ adminRoutes.get("/api/logs", requireAdminAuth, async (c) => {
     const logs = await getRequestLogs(c.env.DB, limit);
     return c.json({ success: true, data: logs });
   } catch (e) {
-    return c.json(jsonError(`获取失败: ${e instanceof Error ? e.message : String(e)}`, "GET_LOGS_ERROR"), 500);
+    return c.json(jsonError(`鑾峰彇澶辫触: ${e instanceof Error ? e.message : String(e)}`, "GET_LOGS_ERROR"), 500);
   }
 });
 
@@ -1904,11 +2173,11 @@ adminRoutes.post("/api/logs/clear", requireAdminAuth, async (c) => {
     await clearRequestLogs(c.env.DB);
     return c.json({ success: true, message: "日志已清空" });
   } catch (e) {
-    return c.json(jsonError(`清空失败: ${e instanceof Error ? e.message : String(e)}`, "CLEAR_LOGS_ERROR"), 500);
+    return c.json(jsonError(`娓呯┖澶辫触: ${e instanceof Error ? e.message : String(e)}`, "CLEAR_LOGS_ERROR"), 500);
   }
 });
 
-// Cache endpoints (Workers Cache API 无法枚举/统计；这里提供兼容返回，保持后台可用)
+// Cache endpoints (Workers Cache API 鏃犳硶鏋氫妇/缁熻锛涜繖閲屾彁渚涘吋瀹硅繑鍥烇紝淇濇寔鍚庡彴鍙敤)
 adminRoutes.get("/api/cache/size", requireAdminAuth, async (c) => {
   try {
     const bytes = await getCacheSizeBytes(c.env.DB);
@@ -1924,7 +2193,7 @@ adminRoutes.get("/api/cache/size", requireAdminAuth, async (c) => {
       },
     });
   } catch (e) {
-    return c.json(jsonError(`获取失败: ${e instanceof Error ? e.message : String(e)}`, "CACHE_SIZE_ERROR"), 500);
+    return c.json(jsonError(`鑾峰彇澶辫触: ${e instanceof Error ? e.message : String(e)}`, "CACHE_SIZE_ERROR"), 500);
   }
 });
 
@@ -1951,7 +2220,7 @@ adminRoutes.get("/api/cache/list", requireAdminAuth, async (c) => {
       data: { total, items: mapped, offset, limit, has_more: offset + mapped.length < total },
     });
   } catch (e) {
-    return c.json(jsonError(`获取失败: ${e instanceof Error ? e.message : String(e)}`, "CACHE_LIST_ERROR"), 500);
+    return c.json(jsonError(`鑾峰彇澶辫触: ${e instanceof Error ? e.message : String(e)}`, "CACHE_LIST_ERROR"), 500);
   }
 });
 
@@ -1961,11 +2230,11 @@ adminRoutes.post("/api/cache/clear", requireAdminAuth, async (c) => {
     const deletedVideos = await clearKvCacheByType(c.env, "video");
     return c.json({
       success: true,
-      message: `缓存清理完成，已删除 ${deletedImages + deletedVideos} 个文件`,
+      message: `缓存清理完成，已删除 ${deletedImages + deletedVideos} 个文件`, 
       data: { deleted_count: deletedImages + deletedVideos },
     });
   } catch (e) {
-    return c.json(jsonError(`清理失败: ${e instanceof Error ? e.message : String(e)}`, "CACHE_CLEAR_ERROR"), 500);
+    return c.json(jsonError(`娓呯悊澶辫触: ${e instanceof Error ? e.message : String(e)}`, "CACHE_CLEAR_ERROR"), 500);
   }
 });
 adminRoutes.post("/api/cache/clear/images", requireAdminAuth, async (c) => {
@@ -1973,7 +2242,7 @@ adminRoutes.post("/api/cache/clear/images", requireAdminAuth, async (c) => {
     const deleted = await clearKvCacheByType(c.env, "image");
     return c.json({ success: true, message: `图片缓存清理完成，已删除 ${deleted} 个文件`, data: { deleted_count: deleted, type: "images" } });
   } catch (e) {
-    return c.json(jsonError(`清理失败: ${e instanceof Error ? e.message : String(e)}`, "IMAGE_CACHE_CLEAR_ERROR"), 500);
+    return c.json(jsonError(`娓呯悊澶辫触: ${e instanceof Error ? e.message : String(e)}`, "IMAGE_CACHE_CLEAR_ERROR"), 500);
   }
 });
 adminRoutes.post("/api/cache/clear/videos", requireAdminAuth, async (c) => {
@@ -1981,7 +2250,7 @@ adminRoutes.post("/api/cache/clear/videos", requireAdminAuth, async (c) => {
     const deleted = await clearKvCacheByType(c.env, "video");
     return c.json({ success: true, message: `视频缓存清理完成，已删除 ${deleted} 个文件`, data: { deleted_count: deleted, type: "videos" } });
   } catch (e) {
-    return c.json(jsonError(`清理失败: ${e instanceof Error ? e.message : String(e)}`, "VIDEO_CACHE_CLEAR_ERROR"), 500);
+    return c.json(jsonError(`娓呯悊澶辫触: ${e instanceof Error ? e.message : String(e)}`, "VIDEO_CACHE_CLEAR_ERROR"), 500);
   }
 });
 
@@ -2000,6 +2269,7 @@ adminRoutes.post("/api/logs/add", requireAdminAuth, async (c) => {
     });
     return c.json({ success: true });
   } catch (e) {
-    return c.json(jsonError(`写入失败: ${e instanceof Error ? e.message : String(e)}`, "LOG_ADD_ERROR"), 500);
+    return c.json(jsonError(`鍐欏叆澶辫触: ${e instanceof Error ? e.message : String(e)}`, "LOG_ADD_ERROR"), 500);
   }
 });
+

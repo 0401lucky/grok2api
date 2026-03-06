@@ -47,8 +47,8 @@ function detectTypeByPath(path: string): CacheType {
   return "image";
 }
 
-function r2Key(type: CacheType, imgPath: string): string {
-  return `${type}/${imgPath}`;
+function r2Key(type: CacheType, canonicalPath: string): string {
+  return `${type}/${encodeURIComponent(canonicalPath)}`;
 }
 
 function parseIntSafe(v: string | undefined, fallback: number): number {
@@ -129,7 +129,10 @@ function responseFromBytes(args: {
 }): Response {
   const headers = new Headers();
   headers.set("Accept-Ranges", "bytes");
-  if (args.corsOrigin) headers.set("Access-Control-Allow-Origin", args.corsOrigin);
+  if (args.corsOrigin) {
+    headers.set("Access-Control-Allow-Origin", args.corsOrigin);
+    headers.set("Vary", "Origin");
+  }
   headers.set("Cache-Control", `public, max-age=${args.cacheSeconds}`);
   headers.set("Content-Type", args.contentType || "application/octet-stream");
   headers.set("X-Content-Type-Options", "nosniff");
@@ -254,7 +257,7 @@ mediaRoutes.get("/images/:imgPath{.+}", async (c) => {
   if (!isAllowedAssetPath(originalPath)) return c.text("Forbidden asset path", 403);
   const url = upstreamUrl ?? new URL(`https://assets.grok.com${originalPath}`);
   const type = detectTypeByPath(originalPath);
-  const key = r2Key(type, imgPath);
+  const key = r2Key(type, originalPath);
   const cacheSeconds = guessCacheSeconds(originalPath);
 
   const rangeHeader = c.req.header("Range");
@@ -306,6 +309,7 @@ mediaRoutes.get("/images/:imgPath{.+}", async (c) => {
 
     c.executionCtx.waitUntil(
       (async () => {
+        let kvWritten = false;
         try {
           let byteCount = 0;
           const limiter = new TransformStream<Uint8Array, Uint8Array>({
@@ -321,6 +325,7 @@ mediaRoutes.get("/images/:imgPath{.+}", async (c) => {
             expiration: expiresAt,
             metadata: { contentType, size: Number.isFinite(contentLength) ? contentLength : byteCount, type },
           });
+          kvWritten = true;
           const now = nowMs();
           await upsertCacheRow(c.env.DB, {
             key,
@@ -331,14 +336,24 @@ mediaRoutes.get("/images/:imgPath{.+}", async (c) => {
             last_access_at: now,
             expires_at: expiresAt * 1000,
           });
-        } catch {
-          // ignore write errors
+        } catch (error) {
+          console.error("Cache write failed:", error);
+          if (kvWritten) {
+            try {
+              await c.env.KV_CACHE.delete(key);
+            } catch (deleteError) {
+              console.error("Cache rollback failed:", deleteError);
+            }
+          }
         }
       })(),
     );
 
     const outHeaders = new Headers(upstream.headers);
-    if (corsOrigin) outHeaders.set("Access-Control-Allow-Origin", corsOrigin);
+    if (corsOrigin) {
+      outHeaders.set("Access-Control-Allow-Origin", corsOrigin);
+      outHeaders.set("Vary", "Origin");
+    }
     outHeaders.set("Cache-Control", `public, max-age=${cacheSeconds}`);
     if (contentType) outHeaders.set("Content-Type", contentType);
     outHeaders.set("X-Content-Type-Options", "nosniff");
@@ -346,7 +361,10 @@ mediaRoutes.get("/images/:imgPath{.+}", async (c) => {
   }
 
   const outHeaders = new Headers(upstream.headers);
-  if (corsOrigin) outHeaders.set("Access-Control-Allow-Origin", corsOrigin);
+  if (corsOrigin) {
+    outHeaders.set("Access-Control-Allow-Origin", corsOrigin);
+    outHeaders.set("Vary", "Origin");
+  }
   outHeaders.set("Cache-Control", `public, max-age=${cacheSeconds}`);
   if (contentType) outHeaders.set("Content-Type", contentType);
   outHeaders.set("X-Content-Type-Options", "nosniff");

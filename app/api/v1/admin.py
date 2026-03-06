@@ -1,11 +1,12 @@
-from fastapi import APIRouter, Depends, HTTPException, Request, Query, Body, WebSocket
-from fastapi.responses import HTMLResponse, RedirectResponse
+﻿from fastapi import APIRouter, Depends, HTTPException, Request, Query, Body, WebSocket
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 from typing import Any, Optional
 
 from app.core.config import config, get_config
 from app.core.storage import get_storage, LocalStorage, RedisStorage, SQLStorage
 from app.core.admin_session import (
+    ADMIN_SESSION_COOKIE,
     create_admin_session_token,
     verify_admin_session,
     verify_admin_session_token,
@@ -22,6 +23,13 @@ import orjson
 from urllib.parse import urlparse
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 from app.core.logger import logger
+from app.core.security import (
+    SECRET_PLACEHOLDER,
+    hash_password,
+    is_weak_password,
+    redact_secret,
+    verify_password,
+)
 from app.services.register import get_auto_register_manager
 from app.services.register.account_settings_refresh import (
     refresh_account_settings_for_tokens,
@@ -48,8 +56,108 @@ class AdminLoginBody(BaseModel):
     username: str | None = None
     password: str | None = None
 
+
+LOGIN_WINDOW_SECONDS = 600
+LOGIN_LOCK_SECONDS = 600
+LOGIN_MAX_ATTEMPTS = 5
+_admin_login_attempts: dict[str, dict[str, int]] = {}
+_admin_login_attempts_lock = asyncio.Lock()
+
+
+def _client_key_from_request(request: Request) -> str:
+    forwarded = str(request.headers.get("cf-connecting-ip") or request.headers.get("x-forwarded-for") or "").strip()
+    if forwarded:
+        return forwarded.split(",", 1)[0].strip() or "unknown"
+    return str(getattr(request.client, "host", "") or "unknown").strip() or "unknown"
+
+
+async def _check_login_throttle(client_key: str) -> int | None:
+    now = int(time.time())
+    async with _admin_login_attempts_lock:
+        state = _admin_login_attempts.get(client_key)
+        if not state:
+            return None
+        locked_until = int(state.get("locked_until") or 0)
+        first_at = int(state.get("first_at") or 0)
+        if locked_until > now:
+            return max(1, locked_until - now)
+        if now - first_at > LOGIN_WINDOW_SECONDS:
+            _admin_login_attempts.pop(client_key, None)
+        return None
+
+
+async def _record_login_failure(client_key: str) -> int | None:
+    now = int(time.time())
+    async with _admin_login_attempts_lock:
+        state = _admin_login_attempts.get(client_key) or {"count": 0, "first_at": now, "locked_until": 0}
+        if now - int(state.get("first_at") or 0) > LOGIN_WINDOW_SECONDS:
+            state = {"count": 0, "first_at": now, "locked_until": 0}
+        state["count"] = int(state.get("count") or 0) + 1
+        if state["count"] >= LOGIN_MAX_ATTEMPTS:
+            state["locked_until"] = now + LOGIN_LOCK_SECONDS
+            _admin_login_attempts[client_key] = state
+            return LOGIN_LOCK_SECONDS
+        _admin_login_attempts[client_key] = state
+        return None
+
+
+async def _clear_login_failures(client_key: str) -> None:
+    async with _admin_login_attempts_lock:
+        _admin_login_attempts.pop(client_key, None)
+
+
+def _session_cookie_secure(request: Request) -> bool:
+    forwarded = str(request.headers.get("x-forwarded-proto") or "").strip().lower()
+    if forwarded:
+        return forwarded == "https"
+    return str(request.url.scheme).lower() == "https"
+
+
+def _set_admin_session_cookie(response: JSONResponse, request: Request, token: str, ttl_hours: int) -> None:
+    response.set_cookie(
+        ADMIN_SESSION_COOKIE,
+        token,
+        max_age=max(1, int(ttl_hours or 8)) * 3600,
+        httponly=True,
+        samesite="lax",
+        secure=_session_cookie_secure(request),
+        path="/",
+    )
+
+
+def _clear_admin_session_cookie(response: JSONResponse) -> None:
+    response.delete_cookie(ADMIN_SESSION_COOKIE, path="/")
+
+
+def _sanitize_config_for_admin_response(cfg: dict[str, Any]) -> dict[str, Any]:
+    app_cfg = dict(cfg.get("app") or {})
+    grok_cfg = dict(cfg.get("grok") or {})
+    register_cfg = dict(cfg.get("register") or {})
+
+    app_secret = str(app_cfg.get("app_key_hash") or app_cfg.get("app_key") or "")
+    app_cfg["app_key"] = redact_secret(app_secret)
+    app_cfg["app_key_set"] = bool(app_secret)
+    app_cfg["api_key"] = redact_secret(str(app_cfg.get("api_key") or ""))
+    app_cfg["api_key_set"] = bool(str(app_cfg.get("api_key") or ""))
+
+    for key in ("cf_clearance", "wreq_emulation_nsfw"):
+        value = str(grok_cfg.get(key) or "")
+        grok_cfg[key] = redact_secret(value)
+        grok_cfg[f"{key}_set"] = bool(value)
+
+    for key in ("admin_password", "yescaptcha_key"):
+        value = str(register_cfg.get(key) or "")
+        register_cfg[key] = redact_secret(value)
+        register_cfg[f"{key}_set"] = bool(value)
+
+    out = dict(cfg)
+    out["app"] = app_cfg
+    out["grok"] = grok_cfg
+    out["register"] = register_cfg
+    return out
+
 async def render_template(filename: str):
-    """渲染指定模板"""
+    """娓叉煋鎸囧畾妯℃澘"""
     template_path = TEMPLATE_DIR / filename
     if not template_path.exists():
         return HTMLResponse(f"Template {filename} not found.", status_code=404)
@@ -77,32 +185,32 @@ async def admin_login_page():
 
 @router.get("/admin/config", response_class=HTMLResponse, include_in_schema=False)
 async def admin_config_page():
-    """配置管理页"""
+    """配置管理页面。"""
     return await render_template("config/config.html")
 
 @router.get("/admin/token", response_class=HTMLResponse, include_in_schema=False)
 async def admin_token_page():
-    """Token 管理页"""
+    """Token 管理页面。"""
     return await render_template("token/token.html")
 
 @router.get("/admin/datacenter", response_class=HTMLResponse, include_in_schema=False)
 async def admin_datacenter_page():
-    """数据中心页"""
+    """数据中心页面。"""
     return await render_template("datacenter/datacenter.html")
 
 @router.get("/admin/keys", response_class=HTMLResponse, include_in_schema=False)
 async def admin_keys_page():
-    """API Key 管理页"""
+    """API Key 管理页面。"""
     return await render_template("keys/keys.html")
 
 @router.get("/chat", response_class=HTMLResponse, include_in_schema=False)
 async def chat_page():
-    """在线聊天页（公开入口）"""
+    """在线聊天页面（公开入口）。"""
     return await render_template("chat/chat.html")
 
 @router.get("/admin/chat", response_class=HTMLResponse, include_in_schema=False)
 async def admin_chat_page():
-    """在线聊天页（后台入口）"""
+    """在线聊天页面（后台入口）。"""
     return await render_template("chat/chat_admin.html")
 
 
@@ -114,15 +222,12 @@ def _parse_ws_subprotocols(websocket: WebSocket) -> list[str]:
 
 
 def _extract_ws_admin_session_token(websocket: WebSocket) -> str:
-    # 首选 Authorization: Bearer <token>
     auth = str(websocket.headers.get("authorization") or "").strip()
     if auth.lower().startswith("bearer "):
         token = auth[7:].strip()
         if token:
             return token
 
-    # 兼容浏览器：通过 Sec-WebSocket-Protocol 传 token
-    # 约定：new WebSocket(url, ["g2a-admin-session", "<session_token>"])
     protocols = _parse_ws_subprotocols(websocket)
     if protocols:
         if "g2a-admin-session" in protocols:
@@ -131,19 +236,25 @@ def _extract_ws_admin_session_token(websocket: WebSocket) -> str:
                 token = protocols[idx + 1].strip()
                 if token:
                     return token
-        # 兜底：支持单协议直传 token
         if len(protocols) == 1:
             single = protocols[0].strip()
             if single and single != "g2a-admin-session":
                 return single
 
+    cookie_header = str(websocket.headers.get("cookie") or "")
+    for item in cookie_header.split(";"):
+        part = item.strip()
+        if not part or "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        if name.strip() == ADMIN_SESSION_COOKIE:
+            return value.strip()
     return ""
-
 
 def _is_allowed_ws_origin(websocket: WebSocket) -> bool:
     origin = str(websocket.headers.get("origin") or "").strip()
     if not origin:
-        # 非浏览器客户端通常不会携带 Origin，允许其继续鉴权流程
+        # 闈炴祻瑙堝櫒瀹㈡埛绔€氬父涓嶄細鎼哄甫 Origin锛屽厑璁稿叾缁х画閴存潈娴佺▼
         return True
     try:
         parsed = urlparse(origin)
@@ -386,20 +497,18 @@ async def admin_imagine_ws(websocket: WebSocket):
 
 @router.post("/api/v1/admin/login")
 async def admin_login_api(request: Request, body: AdminLoginBody | None = Body(default=None)):
-    """管理后台登录验证（用户名+密码）
-
-    - 登录成功后返回短期后台会话 token（用于 `/api/v1/admin/*` 鉴权）
-    - 后台弱密码（如 admin / 空密码）会被拒绝登录，需先改为强密码
-    - 兼容旧版本：允许 Authorization: Bearer <password> 仅密码登录（用户名默认为 admin）
-    """
-
     admin_username = str(get_config("app.admin_username", "admin") or "admin").strip() or "admin"
+    admin_password_hash = str(get_config("app.app_key_hash", "") or "").strip()
     admin_password = str(get_config("app.app_key", "") or "").strip()
+    client_key = _client_key_from_request(request)
+
+    retry_after = await _check_login_throttle(client_key)
+    if retry_after:
+        raise HTTPException(status_code=429, detail=f"Too many login attempts. Retry after {retry_after}s.")
 
     username = (body.username.strip() if body and isinstance(body.username, str) else "").strip()
     password = (body.password.strip() if body and isinstance(body.password, str) else "").strip()
 
-    # Legacy: password-only via Bearer token.
     if not password:
         auth = request.headers.get("Authorization") or ""
         if auth.lower().startswith("bearer "):
@@ -410,18 +519,32 @@ async def admin_login_api(request: Request, body: AdminLoginBody | None = Body(d
     if not username or not password:
         raise HTTPException(status_code=400, detail="Missing username or password")
 
-    if not admin_password:
+    if not admin_password and not admin_password_hash:
         raise HTTPException(status_code=503, detail="Admin password is not configured")
 
-    if _is_weak_admin_secret(admin_password) and not _allow_weak_admin_password():
+    weak_admin_password = is_weak_password(admin_password_hash, admin_password)
+    placeholder_bootstrap = password == "__CHANGE_ME__" and verify_password(
+        "__CHANGE_ME__",
+        admin_password_hash,
+        admin_password,
+    )
+    if weak_admin_password and not _allow_weak_admin_password() and not placeholder_bootstrap:
         raise HTTPException(
             status_code=503,
             detail="Admin password is weak or not initialized. Please set app.app_key to a strong value first. "
             "If this is a controlled bootstrap, set ALLOW_WEAK_ADMIN_PASSWORD=true temporarily.",
         )
 
-    if username != admin_username or password != admin_password:
+    if username != admin_username or not verify_password(password, admin_password_hash, admin_password):
+        locked_for = await _record_login_failure(client_key)
+        if locked_for:
+            raise HTTPException(status_code=429, detail=f"Too many login attempts. Retry after {locked_for}s.")
         raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    await _clear_login_failures(client_key)
+
+    if not admin_password_hash and admin_password:
+        await config.update({"app": {"app_key_hash": hash_password(admin_password), "app_key": ""}})
 
     session_ttl_hours = 8
     try:
@@ -430,30 +553,73 @@ async def admin_login_api(request: Request, body: AdminLoginBody | None = Body(d
         session_ttl_hours = 8
     session_ttl_hours = max(1, min(72, session_ttl_hours))
     session_token = create_admin_session_token(admin_username, ttl_hours=session_ttl_hours)
-    # 为兼容现有前端结构，仍沿用字段名 api_key，值改为后台会话 token。
-    return {"status": "success", "api_key": session_token}
+    response = JSONResponse({"status": "success", "password_reset_required": weak_admin_password and placeholder_bootstrap})
+    _set_admin_session_cookie(response, request, session_token, session_ttl_hours)
+    return response
 
 
 @router.post("/api/v1/admin/logout")
-async def admin_logout_api(session_token: str = Depends(verify_admin_session)):
-    """注销当前后台会话（服务端立即失效）。"""
+async def admin_logout_api(request: Request, session_token: str = Depends(verify_admin_session)):
     try:
         revoke_admin_session_token(session_token)
     except Exception as e:
         logger.warning(f"Admin logout revoke failed: {e}")
-    return {"status": "success"}
+    response = JSONResponse({"status": "success"})
+    _clear_admin_session_cookie(response)
+    return response
+
 
 @router.get("/api/v1/admin/config", dependencies=[Depends(verify_admin_session)])
 async def get_config_api():
-    """获取当前配置"""
-    # 暴露原始配置字典
-    return config._config
+    return _sanitize_config_for_admin_response(config._config)
 
 @router.post("/api/v1/admin/config", dependencies=[Depends(verify_admin_session)])
 async def update_config_api(data: dict):
-    """更新配置"""
     try:
-        await config.update(data)
+        payload = dict(data or {})
+        app_cfg = payload.get("app") if isinstance(payload.get("app"), dict) else {}
+        grok_cfg = payload.get("grok") if isinstance(payload.get("grok"), dict) else {}
+        register_cfg = payload.get("register") if isinstance(payload.get("register"), dict) else {}
+        for mapping in (app_cfg, grok_cfg, register_cfg):
+            for key in list(mapping.keys()):
+                if str(key).endswith("_set"):
+                    mapping.pop(key, None)
+
+        if isinstance(app_cfg.get("app_key"), str):
+            value = app_cfg.get("app_key", "").strip()
+            if value and value != SECRET_PLACEHOLDER:
+                app_cfg["app_key_hash"] = hash_password(value)
+                app_cfg["app_key"] = ""
+            else:
+                app_cfg.pop("app_key", None)
+
+        if isinstance(app_cfg.get("api_key"), str):
+            value = app_cfg.get("api_key", "").strip()
+            if not value or value == SECRET_PLACEHOLDER:
+                app_cfg.pop("api_key", None)
+            else:
+                app_cfg["api_key"] = value
+
+        for key in ("cf_clearance", "wreq_emulation_nsfw"):
+            if isinstance(grok_cfg.get(key), str):
+                value = grok_cfg.get(key, "").strip()
+                if not value or value == SECRET_PLACEHOLDER:
+                    grok_cfg.pop(key, None)
+                else:
+                    grok_cfg[key] = value
+
+        for key in ("admin_password", "yescaptcha_key"):
+            if isinstance(register_cfg.get(key), str):
+                value = register_cfg.get(key, "").strip()
+                if not value or value == SECRET_PLACEHOLDER:
+                    register_cfg.pop(key, None)
+                else:
+                    register_cfg[key] = value
+
+        payload["app"] = app_cfg
+        payload["grok"] = grok_cfg
+        payload["register"] = register_cfg
+        await config.update(payload)
         return {"status": "success", "message": "配置已更新"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -774,7 +940,7 @@ async def delete_api_key(data: dict):
 
 @router.get("/api/v1/admin/storage", dependencies=[Depends(verify_admin_session)])
 async def get_storage_info():
-    """获取当前存储模式"""
+    """鑾峰彇褰撳墠瀛樺偍妯″紡"""
     storage_type = os.getenv("SERVER_STORAGE_TYPE", "local").lower()
     logger.info(f"Storage type: {storage_type}")
     if not storage_type:
@@ -796,7 +962,7 @@ async def get_storage_info():
 
 @router.get("/api/v1/admin/tokens", dependencies=[Depends(verify_admin_session)])
 async def get_tokens_api():
-    """获取所有 Token"""
+    """鑾峰彇鎵€鏈?Token"""
     storage = get_storage()
     tokens = await storage.load_tokens()
     data = tokens if isinstance(tokens, dict) else {}
@@ -859,7 +1025,7 @@ async def update_tokens_api(data: dict):
 
 @router.post("/api/v1/admin/tokens/refresh", dependencies=[Depends(verify_admin_session)])
 async def refresh_tokens_api(data: dict):
-    """刷新 Token 状态"""
+    """刷新 Token 状态。"""
     from app.services.token.manager import get_token_manager
     
     try:
@@ -890,7 +1056,7 @@ async def refresh_tokens_api(data: dict):
 
 @router.post("/api/v1/admin/tokens/nsfw/enable", dependencies=[Depends(verify_admin_session)])
 async def enable_tokens_nsfw_api(data: dict):
-    """批量开启 NSFW（仅开启开关并打 tag，不做协议/生日/失效处理）。"""
+    """批量开启 NSFW。"""
     payload = data if isinstance(data, dict) else {}
     mgr = await get_token_manager()
 
@@ -1024,7 +1190,7 @@ async def enable_tokens_nsfw_api(data: dict):
         "results": out,
     }
     if truncated:
-        response["warning"] = f"数量超出限制，仅处理前 {max_tokens} 个（共 {original_count} 个）"
+        response["warning"] = f"鏁伴噺瓒呭嚭闄愬埗锛屼粎澶勭悊鍓?{max_tokens} 涓紙鍏?{original_count} 涓級"
     return response
 
 
@@ -1225,12 +1391,12 @@ async def auto_register_stop_api(job_id: str | None = None):
 
 @router.get("/admin/cache", response_class=HTMLResponse, include_in_schema=False)
 async def admin_cache_page():
-    """缓存管理页"""
+    """缓存管理页面。"""
     return await render_template("cache/cache.html")
 
 @router.get("/api/v1/admin/cache", dependencies=[Depends(verify_admin_session)])
 async def get_cache_stats_api(request: Request):
-    """获取缓存统计"""
+    """鑾峰彇缂撳瓨缁熻"""
     from app.services.grok.assets import DownloadService, ListService
     from app.services.token.manager import get_token_manager
     
@@ -1356,7 +1522,7 @@ async def get_cache_stats_api(request: Request):
 
 @router.post("/api/v1/admin/cache/clear", dependencies=[Depends(verify_admin_session)])
 async def clear_local_cache_api(data: dict):
-    """清理本地缓存"""
+    """娓呯悊鏈湴缂撳瓨"""
     from app.services.grok.assets import DownloadService
     cache_type = data.get("type", "image")
     
@@ -1374,7 +1540,7 @@ async def list_local_cache_api(
     page: int = 1,
     page_size: int = 1000
 ):
-    """列出本地缓存文件"""
+    """鍒楀嚭鏈湴缂撳瓨鏂囦欢"""
     from app.services.grok.assets import DownloadService
     try:
         if type_:
@@ -1387,7 +1553,7 @@ async def list_local_cache_api(
 
 @router.post("/api/v1/admin/cache/item/delete", dependencies=[Depends(verify_admin_session)])
 async def delete_local_cache_item_api(data: dict):
-    """删除单个本地缓存文件"""
+    """鍒犻櫎鍗曚釜鏈湴缂撳瓨鏂囦欢"""
     from app.services.grok.assets import DownloadService
     cache_type = data.get("type", "image")
     name = data.get("name")
@@ -1402,7 +1568,7 @@ async def delete_local_cache_item_api(data: dict):
 
 @router.post("/api/v1/admin/cache/online/clear", dependencies=[Depends(verify_admin_session)])
 async def clear_online_cache_api(data: dict):
-    """清理在线缓存"""
+    """娓呯悊鍦ㄧ嚎缂撳瓨"""
     from app.services.grok.assets import DeleteService
     from app.services.token.manager import get_token_manager
     
@@ -1457,7 +1623,7 @@ async def clear_online_cache_api(data: dict):
 
 @router.get("/api/v1/admin/metrics", dependencies=[Depends(verify_admin_session)])
 async def get_metrics_api():
-    """数据中心：聚合常用指标（token/cache/request_stats）。"""
+    """数据中心聚合指标。"""
     try:
         from app.services.request_stats import request_stats
         from app.services.token.manager import get_token_manager
@@ -1519,7 +1685,7 @@ async def get_metrics_api():
 
 @router.get("/api/v1/admin/cache/local", dependencies=[Depends(verify_admin_session)])
 async def get_cache_local_stats_api():
-    """仅获取本地缓存统计（用于前端实时刷新）。"""
+    """获取本地缓存统计。"""
     from app.services.grok.assets import DownloadService
 
     try:
@@ -1601,7 +1767,7 @@ def _tail_lines(path: Path, max_lines: int = 2000, max_bytes: int = 1024 * 1024)
 
 @router.get("/api/v1/admin/logs/files", dependencies=[Depends(verify_admin_session)])
 async def list_log_files_api():
-    """列出可查看的日志文件（logs/*.log）。"""
+    """列出可查看的日志文件。"""
     from app.core.logger import LOG_DIR
 
     try:
@@ -1626,7 +1792,7 @@ async def list_log_files_api():
 
 @router.get("/api/v1/admin/logs/tail", dependencies=[Depends(verify_admin_session)])
 async def tail_log_api(file: str | None = None, lines: int = 500):
-    """读取后台日志（尾部）。"""
+    """读取后台日志尾部内容。"""
     from app.core.logger import LOG_DIR
 
     try:

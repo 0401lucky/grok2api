@@ -1,7 +1,7 @@
-services:
+﻿services:
   grok2api:
     container_name: grok2api
-    image: ${GROK2API_IMAGE:-ghcr.io/tqzhr/grok2api:latest}
+    image: ${GROK2API_IMAGE:-grok2api:local}
     ports:
       - "${GROK2API_PORT:-8000}:${SERVER_PORT:-8000}"
     environment:
@@ -78,3 +78,4 @@ volumes:
   redis-data:
   pgsql-data:
   mysql-data:
+

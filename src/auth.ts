@@ -1,9 +1,12 @@
 import type { MiddlewareHandler } from "hono";
+import { getCookie } from "hono/cookie";
 import type { Env } from "./env";
 import { getSettings } from "./settings";
 import { dbFirst } from "./db";
 import { validateApiKey } from "./repo/apiKeys";
 import { verifyAdminSession } from "./repo/adminSessions";
+
+const ADMIN_SESSION_COOKIE = "g2a_admin_session";
 
 export interface ApiAuthInfo {
   key: string | null;
@@ -13,8 +16,8 @@ export interface ApiAuthInfo {
 
 function bearerToken(authHeader: string | null): string | null {
   if (!authHeader) return null;
-  const m = authHeader.match(/^Bearer\s+(.+)$/i);
-  return m?.[1]?.trim() || null;
+  const match = authHeader.match(/^Bearer\s+(.+)$/i);
+  return match?.[1]?.trim() || null;
 }
 
 function authError(message: string, code: string): Record<string, unknown> {
@@ -28,8 +31,8 @@ function authError(message: string, code: string): Record<string, unknown> {
 }
 
 function envBool(value: string | undefined): boolean {
-  const v = String(value ?? "").trim().toLowerCase();
-  return v === "1" || v === "true" || v === "yes" || v === "on";
+  const normalized = String(value ?? "").trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
 }
 
 export const requireApiAuth: MiddlewareHandler<{ Bindings: Env; Variables: { apiAuth: ApiAuthInfo } }> = async (
@@ -53,7 +56,7 @@ export const requireApiAuth: MiddlewareHandler<{ Bindings: Env; Variables: { api
       }
     }
     if (!globalKey) {
-      return c.json(authError("API key 未配置。请设置 key 或显式开启 ALLOW_ANON_API。", "api_key_not_configured"), 401);
+      return c.json(authError("API Key 未配置，请先设置或显式开启 ALLOW_ANON_API。", "api_key_not_configured"), 401);
     }
     return c.json(authError("缺少认证令牌", "missing_token"), 401);
   }
@@ -74,7 +77,7 @@ export const requireApiAuth: MiddlewareHandler<{ Bindings: Env; Variables: { api
 };
 
 export const requireAdminAuth: MiddlewareHandler<{ Bindings: Env }> = async (c, next) => {
-  const token = bearerToken(c.req.header("Authorization") ?? null);
+  const token = bearerToken(c.req.header("Authorization") ?? null) ?? getCookie(c, ADMIN_SESSION_COOKIE) ?? null;
   if (!token) return c.json({ error: "缺少会话", code: "MISSING_SESSION" }, 401);
   const ok = await verifyAdminSession(c.env.DB, token);
   if (!ok) return c.json({ error: "会话已过期", code: "SESSION_EXPIRED" }, 401);

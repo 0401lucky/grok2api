@@ -1,6 +1,6 @@
-# Grok2API
+﻿# Grok2API
 
-[中文](../readme.md) | **English**
+[涓枃](../readme.md) | **English**
 
 > [!NOTE]
 > This project is for learning and research only. You must comply with Grok's Terms of Use and applicable laws. Do not use it for illegal purposes.
@@ -26,6 +26,8 @@ This fork additionally provides a **Cloudflare Workers / Pages** deployment (Typ
 - Local development
 
 ```
+Python 3.13+ is required.
+
 uv sync
 
 uv run main.py
@@ -37,19 +39,12 @@ python scripts/smoke_test.py --base-url http://127.0.0.1:8000
 - Deployment
 
 ```
-git clone https://github.com/TQZHR/grok2api.git
+git clone <your-repo-url>
 
 # Enter the project directory
 cd grok2api
 
-# Pull and run the prebuilt image (default)
-docker compose up -d
-
-# Update to the latest image
-docker compose pull
-docker compose up -d
-
-# Build from current source and run (optional)
+# Build from current source and run (default)`r`ndocker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build`r`n`r`n# If you already have your own public image, set GROK2API_IMAGE and then run docker compose up -d`r`n`r`n# Build from current source and run (optional)
 docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 
 # (Optional) Smoke check
@@ -61,7 +56,7 @@ python scripts/smoke_test.py --base-url http://127.0.0.1:8000
 Run these checks before one-click deployment updates:
 
 ```bash
-uv run pytest -q
+uv run --with pytest pytest -q
 npm run typecheck
 python scripts/check_model_catalog_sync.py
 npx wrangler deploy --dry-run --config wrangler.toml
@@ -80,7 +75,7 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml config
 ### Admin panel
 
 URL: `http://<host>:8000/login`  
-Default username/password: `admin` / `admin` (config keys `app.admin_username` / `app.app_key`, change it in production).
+Default username: `admin`. Default password is a placeholder and must be changed before normal use (config keys `app.admin_username` / `app.app_key`).
 
 Pages:
 - `http://<host>:8000/admin/token`: Token management (import/export/batch ops/auto register)
@@ -203,10 +198,10 @@ curl http://localhost:8000/v1/chat/completions \
 | `stream` | boolean | Enable streaming | `true`, `false` |
 | `thinking` | string | Thinking mode | `enabled`, `disabled`, `null` |
 | `video_config` | object | **Video model only** | - |
-| └─ `aspect_ratio` | string | Video aspect ratio | `16:9`, `9:16`, `1:1`, `2:3`, `3:2` |
-| └─ `video_length` | integer | Video length (seconds) | `5` - `15` |
-| └─ `resolution` | string | Resolution | `SD`, `HD` |
-| └─ `preset` | string | Style preset | `fun`, `normal`, `spicy` |
+| 鈹斺攢 `aspect_ratio` | string | Video aspect ratio | `16:9`, `9:16`, `1:1`, `2:3`, `3:2` |
+| 鈹斺攢 `video_length` | integer | Video length (seconds) | `5` - `15` |
+| 鈹斺攢 `resolution` | string | Resolution | `SD`, `HD` |
+| 鈹斺攢 `preset` | string | Style preset | `fun`, `normal`, `spicy` |
 
 Note: any other parameters will be discarded and ignored.
 
@@ -380,7 +375,7 @@ When upgrading from older versions, the service will keep existing local data an
 | :--- | :--- | :--- | :--- | :--- |
 | **app** | `app_url` | App URL | External access URL for Grok2API (used for file links). | `http://127.0.0.1:8000` |
 | | `admin_username` | Admin username | Username for the Grok2API admin panel. | `admin` |
-| | `app_key` | Admin password | Password for the Grok2API admin panel. | `admin` |
+| | `app_key` | Admin password | Password for the Grok2API admin panel. | `__CHANGE_ME__` |
 | | `api_key` | API key | Bearer token required to call Grok2API. | `""` |
 | | `image_format` | Image format | Output image format (`url`, `base64`, or `b64_json`). | `url` |
 | | `video_format` | Video format | Output video format (url only). | `url` |
@@ -408,7 +403,7 @@ When upgrading from older versions, the service will keep existing local data an
 | | `nsfw_refresh_retries` | NSFW refresh retries | Extra retries after a failure (excluding the first attempt). | `3` |
 | **cache** | `enable_auto_clean` | Auto clean | Enable cache auto clean; cleanup when exceeding limit. | `true` |
 | | `limit_mb` | Cleanup threshold | Cache size threshold (MB) that triggers cleanup. | `1024` |
-| | `keep_base64_cache` | Keep base64 cache | Keep downloaded image/video cache files when returning Base64 (avoid “local cache = 0”). | `true` |
+| | `keep_base64_cache` | Keep base64 cache | Keep downloaded image/video cache files when returning Base64 (avoid 鈥渓ocal cache = 0鈥?. | `true` |
 | **performance** | `assets_max_concurrent` | Assets concurrency | Concurrency cap for assets upload/download/list. Recommended 25. | `25` |
 | | `media_max_concurrent` | Media concurrency | Concurrency cap for video/media generation. Recommended 50. | `50` |
 | | `usage_max_concurrent` | Usage concurrency | Concurrency cap for usage queries. Recommended 25. | `25` |
@@ -440,3 +435,6 @@ When upgrading from older versions, the service will keep existing local data an
 ## Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=TQZHR/grok2api&type=Timeline)](https://star-history.com/#TQZHR/grok2api&Timeline)
+
+
+

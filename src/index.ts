@@ -34,6 +34,16 @@ function isDebugRequest(c: any): boolean {
 
 function withResponseHeaders(res: Response, extra: Record<string, string>): Response {
   const headers = new Headers(res.headers);
+  headers.set("x-content-type-options", headers.get("x-content-type-options") ?? "nosniff");
+  headers.set("x-frame-options", headers.get("x-frame-options") ?? "DENY");
+  headers.set("referrer-policy", headers.get("referrer-policy") ?? "same-origin");
+  headers.set("cross-origin-opener-policy", headers.get("cross-origin-opener-policy") ?? "same-origin");
+  headers.set("permissions-policy", headers.get("permissions-policy") ?? "camera=(), microphone=(), geolocation=()");
+  headers.set(
+    "content-security-policy",
+    headers.get("content-security-policy") ??
+      "default-src 'self'; img-src 'self' data: https: blob:; media-src 'self' https: blob:; connect-src 'self' https: ws: wss:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+  );
   for (const [k, v] of Object.entries(extra)) headers.set(k, v);
   return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
 }

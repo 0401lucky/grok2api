@@ -302,18 +302,6 @@ async function init() {
   if (isAdminChat()) {
     const adminSession = await ensureApiKey();
     if (adminSession === null) return;
-    try {
-      const res = await fetch('/api/v1/admin/config', { headers: buildAuthHeaders(adminSession) });
-      if (res.status === 401) return logout();
-      if (res.ok) {
-        const cfg = await res.json();
-        const k = String(cfg?.app?.api_key || '').trim();
-        if (k) {
-          q('api-key-input').value = k;
-          localStorage.setItem(STORAGE_KEY, k);
-        }
-      }
-    } catch (e) {}
   }
 
   const saved = localStorage.getItem(STORAGE_KEY) || '';
@@ -556,14 +544,6 @@ function buildImagineWsUrl() {
   return url.toString();
 }
 
-function getAdminSessionToken() {
-  try {
-    return String(localStorage.getItem('grok2api_admin_session') || '').trim();
-  } catch (e) {
-    return '';
-  }
-}
-
 function parseWsMessage(raw) {
   if (!raw) return null;
   try {
@@ -575,10 +555,7 @@ function parseWsMessage(raw) {
 
 function openImageContinuousSocket(socketIndex, runToken, prompt, aspectRatio, attempt = 0) {
   const wsUrl = buildImagineWsUrl();
-  const adminSessionToken = getAdminSessionToken();
-  const ws = adminSessionToken
-    ? new WebSocket(wsUrl, ['g2a-admin-session', adminSessionToken])
-    : new WebSocket(wsUrl);
+  const ws = new WebSocket(wsUrl, ['g2a-admin-session']);
   const socketState = {
     index: socketIndex,
     ws,

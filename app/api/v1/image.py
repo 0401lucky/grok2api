@@ -1031,7 +1031,7 @@ async def edit_image(
     await enforce_daily_quota(api_key, model_id, image_count=n)
 
     max_image_bytes = 50 * 1024 * 1024
-    allowed_types = {"image/png", "image/jpeg", "image/webp", "image/jpg"}
+    allowed_types = {"image/png", "image/jpeg", "image/webp", "image/jpg", "image/gif"}
     image_payloads: List[str] = []
 
     for item in images:
@@ -1061,9 +1061,11 @@ async def edit_image(
                 mime = "image/png"
             elif ext == ".webp":
                 mime = "image/webp"
+            elif ext == ".gif":
+                mime = "image/gif"
             else:
                 raise ValidationException(
-                    message="Unsupported image type. Supported: png, jpg, webp.",
+                    message="Unsupported image type. Supported: png, jpg, webp, gif.",
                     param="image",
                     code="invalid_image_type",
                 )

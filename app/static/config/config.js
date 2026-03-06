@@ -24,6 +24,8 @@ const NUMERIC_FIELDS = new Set([
   'register_threads',
   'default_count'
 ]);
+const SECRET_FIELDS = new Set(['api_key', 'app_key', 'cf_clearance', 'wreq_emulation_nsfw', 'admin_password', 'yescaptcha_key']);
+const SECRET_PLACEHOLDER = '__KEEP_EXISTING__';
 
 const LOCALE_MAP = {
   "app": {
@@ -177,8 +179,11 @@ function renderConfig(data) {
     }
 
     keys.forEach(key => {
+      if (key.endsWith('_set')) return;
       const val = items[key];
       const text = getText(section, key);
+      const isSecret = SECRET_FIELDS.has(key);
+      const isSecretSet = Boolean(items[`${key}_set`]);
 
       // Container
       const fieldCard = document.createElement('div');
@@ -289,11 +294,12 @@ function renderConfig(data) {
         input = document.createElement('input');
         input.type = 'text';
         input.className = 'geist-input';
-        input.value = val;
+        input.value = isSecret ? '' : val;
         input.dataset.section = section;
         input.dataset.key = key;
 
         if (key === 'app_key') input.type = 'password';
+        if (isSecret && isSecretSet) input.placeholder = '已设置，留空表示不修改';
 
         if (key === 'api_key' || key === 'app_key') {
           const wrapper = document.createElement('div');
@@ -307,6 +313,7 @@ function renderConfig(data) {
           copyBtn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>`;
 
           copyBtn.onclick = () => copyToClipboard(input.value, copyBtn);
+          copyBtn.disabled = isSecret && !input.value;
 
           wrapper.appendChild(input);
           wrapper.appendChild(copyBtn);
@@ -349,11 +356,16 @@ async function saveConfig() {
         try { val = JSON.parse(val); } catch (e) { throw new Error(`无效的 JSON: ${getText(s, k).title}`); }
       } else if (k === 'admin_username' && val.trim() === '') {
         throw new Error('后台账号不能为空');
-      } else if (k === 'app_key' && val.trim() === '') {
-        throw new Error('后台密码不能为空');
       } else if (NUMERIC_FIELDS.has(k)) {
         if (val.trim() !== '' && !Number.isNaN(Number(val))) {
           val = Number(val);
+        }
+      }
+
+      if (typeof val === 'string' && SECRET_FIELDS.has(k)) {
+        const currentSet = Boolean(currentConfig?.[s]?.[`${k}_set`]);
+        if (val.trim() === '' && currentSet) {
+          val = SECRET_PLACEHOLDER;
         }
       }
 

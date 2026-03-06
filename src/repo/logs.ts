@@ -2,6 +2,8 @@ import type { Env } from "../env";
 import { dbAll, dbRun } from "../db";
 import { nowMs, formatUtcMs } from "../utils/time";
 
+const REQUEST_LOG_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
 export interface RequestLogRow {
   id: string;
   time: string;
@@ -38,6 +40,7 @@ export async function addRequestLog(
       entry.error,
     ],
   );
+  await dbRun(db, "DELETE FROM request_logs WHERE timestamp < ?", [ts - REQUEST_LOG_RETENTION_MS]);
 }
 
 export async function getRequestLogs(db: Env["DB"], limit = 1000): Promise<RequestLogRow[]> {

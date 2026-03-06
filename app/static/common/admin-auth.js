@@ -1,36 +1,24 @@
-const APP_KEY_STORAGE = 'grok2api_admin_session';
-let cachedApiKey = null;
+let cachedSessionValid = false;
 
 function clearStoredAppKey() {
-  localStorage.removeItem(APP_KEY_STORAGE);
-  cachedApiKey = null;
+  cachedSessionValid = false;
 }
 
 async function getStoredAppKey() {
-  return (localStorage.getItem(APP_KEY_STORAGE) || '').trim();
+  return '';
 }
 
-async function storeAppKey(input) {
-  const token = typeof input === 'string'
-    ? input.trim()
-    : (input && typeof input === 'object' ? String(input.api_key || '').trim() : '');
-  if (!token) {
-    clearStoredAppKey();
-    return;
-  }
-  localStorage.setItem(APP_KEY_STORAGE, token);
-  cachedApiKey = `Bearer ${token}`;
+async function storeAppKey() {
+  cachedSessionValid = true;
 }
 
 function buildAuthHeaders(apiKey) {
-  return apiKey ? { 'Authorization': apiKey } : {};
+  return apiKey ? { Authorization: apiKey } : {};
 }
 
-async function validateSession(apiKey) {
+async function validateSession() {
   try {
-    const res = await fetch('/api/v1/admin/storage', {
-      headers: buildAuthHeaders(apiKey)
-    });
+    const res = await fetch('/api/v1/admin/storage');
     return res.ok;
   } catch (e) {
     return false;
@@ -38,41 +26,21 @@ async function validateSession(apiKey) {
 }
 
 async function ensureApiKey() {
-  if (cachedApiKey) {
-    const ok = await validateSession(cachedApiKey);
-    if (ok) return cachedApiKey;
-    clearStoredAppKey();
-  }
-
-  const token = await getStoredAppKey();
-  if (!token) {
-    window.location.href = '/login';
-    return null;
-  }
-
-  const apiKey = `Bearer ${token}`;
-  const ok = await validateSession(apiKey);
+  if (cachedSessionValid) return '';
+  const ok = await validateSession();
   if (!ok) {
     clearStoredAppKey();
     window.location.href = '/login';
     return null;
   }
-
-  cachedApiKey = apiKey;
-  return cachedApiKey;
+  cachedSessionValid = true;
+  return '';
 }
 
 async function logout() {
   try {
-    const token = await getStoredAppKey();
-    if (token) {
-      await fetch('/api/v1/admin/logout', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}` }
-      });
-    }
+    await fetch('/api/v1/admin/logout', { method: 'POST' });
   } catch (e) {
-    // ignore logout network errors
   } finally {
     clearStoredAppKey();
     window.location.href = '/login';
@@ -84,11 +52,11 @@ async function fetchStorageType() {
   if (apiKey === null) return null;
   try {
     const res = await fetch('/api/v1/admin/storage', {
-      headers: buildAuthHeaders(apiKey)
+      headers: buildAuthHeaders(apiKey),
     });
     if (!res.ok) return null;
     const data = await res.json();
-    return (data && data.type) ? String(data.type) : null;
+    return data && data.type ? String(data.type) : null;
   } catch (e) {
     return null;
   }
@@ -104,7 +72,7 @@ function formatStorageLabel(type) {
     postgres: 'pgsql',
     postgresql: 'pgsql',
     d1: 'd1',
-    redis: 'redis'
+    redis: 'redis',
   };
   return map[normalized] || '-';
 }

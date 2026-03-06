@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from fastapi import HTTPException, Security, status
+from fastapi import HTTPException, Request, Security, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.core.config import get_config
@@ -25,6 +25,7 @@ from app.core.config import get_config
 
 SESSION_TOKEN_PREFIX = "g2a"
 DEFAULT_SESSION_HOURS = 8
+ADMIN_SESSION_COOKIE = "g2a_admin_session"
 REVOCATION_FILE = Path(__file__).parent.parent.parent / "data" / "admin_session_revocations.json"
 
 _revoked_jti_cache: dict[str, int] | None = None
@@ -51,11 +52,13 @@ def _b64url_decode(data: str) -> bytes:
 
 
 def _session_secret() -> bytes:
+    app_key_hash = str(get_config("app.app_key_hash", "") or "").strip()
     app_key = str(get_config("app.app_key", "") or "").strip()
-    if not app_key:
+    material = app_key_hash or app_key
+    if not material:
         return b""
     extra_secret = str(os.getenv("ADMIN_SESSION_SECRET", "") or "").strip()
-    material = f"{app_key}:{extra_secret}" if extra_secret else app_key
+    material = f"{material}:{extra_secret}" if extra_secret else material
     return hashlib.sha256(material.encode("utf-8")).digest()
 
 
@@ -241,17 +244,21 @@ def revoke_admin_session_token(token: str) -> bool:
 
 
 async def verify_admin_session(
+    request: Request,
     auth: Optional[HTTPAuthorizationCredentials] = Security(security),
 ) -> str:
     """FastAPI 依赖：验证后台会话令牌。"""
-    if not auth:
+    token = str(auth.credentials or "").strip() if auth else ""
+    if not token:
+        token = str(request.cookies.get(ADMIN_SESSION_COOKIE, "") or "").strip()
+
+    if not token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing admin session",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    token = str(auth.credentials or "").strip()
     if not verify_admin_session_token(token):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

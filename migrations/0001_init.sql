@@ -74,7 +74,7 @@ INSERT OR IGNORE INTO settings (key, value, updated_at)
 VALUES
   (
     'global',
-    '{"base_url":"","log_level":"INFO","image_mode":"url","admin_password":"admin","admin_username":"admin","image_cache_max_size_mb":512,"video_cache_max_size_mb":1024}',
+    '{"base_url":"","log_level":"INFO","image_mode":"url","admin_password":"__CHANGE_ME__","admin_password_hash":"","admin_username":"admin","image_cache_max_size_mb":512,"video_cache_max_size_mb":1024}',
     CAST(strftime('%s','now') AS INTEGER) * 1000
   ),
   (

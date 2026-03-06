@@ -223,14 +223,13 @@ if __name__ == "__main__":
     port = int(os.getenv("SERVER_PORT", "8000"))
     workers = int(os.getenv("SERVER_WORKERS", "1"))
 
-    # 平台检查
-    is_windows = platform.system() == "Windows"
-
-    # 自动降级
-    if is_windows and workers > 1:
+    # 当前还有部分本地文件/内存状态（如后台会话吊销、旧式统计等），多 worker 下容易出现不一致。
+    # 默认强制单 worker；如确需自行承担风险，可显式设置 SERVER_ALLOW_MULTI_WORKERS=true。
+    allow_multi_workers = _parse_bool_env("SERVER_ALLOW_MULTI_WORKERS", False)
+    if workers > 1 and not allow_multi_workers:
         logger.warning(
-            f"Windows platform detected. Multiple workers ({workers}) is not supported. "
-            "Using single worker instead.",
+            f"Multiple workers ({workers}) are disabled by default to avoid state inconsistency. "
+            "Set SERVER_ALLOW_MULTI_WORKERS=true only if you understand the trade-offs.",
         )
         workers = 1
 

@@ -4,6 +4,7 @@
 
 import sys
 import json
+import os
 import traceback
 import threading
 from pathlib import Path
@@ -16,6 +17,19 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 _file_lock = threading.Lock()
 _file_date: str | None = None
 _file_handle = None
+LOG_RETENTION_DAYS = max(1, int(os.getenv("LOG_RETENTION_DAYS", "14") or "14"))
+
+
+def _cleanup_old_log_files() -> None:
+    try:
+        files = sorted(LOG_DIR.glob("app_*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+    except Exception:
+        return
+    for old in files[LOG_RETENTION_DAYS:]:
+        try:
+            old.unlink(missing_ok=True)
+        except Exception:
+            continue
 
 
 def _format_json(record) -> str:
@@ -79,6 +93,7 @@ def _file_json_sink(message):
                     _file_handle.close()
             except Exception:
                 pass
+            _cleanup_old_log_files()
             _file_handle = open(log_file, "a", encoding="utf-8")
             _file_date = log_date
 
