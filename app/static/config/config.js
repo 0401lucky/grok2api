@@ -24,7 +24,7 @@ const NUMERIC_FIELDS = new Set([
   'register_threads',
   'default_count'
 ]);
-const SECRET_FIELDS = new Set(['api_key', 'app_key', 'cf_clearance', 'wreq_emulation_nsfw', 'admin_password', 'yescaptcha_key']);
+const SECRET_FIELDS = new Set(['api_key', 'app_key', 'linuxdo_client_secret', 'cf_clearance', 'wreq_emulation_nsfw', 'admin_password', 'yescaptcha_key']);
 const SECRET_PLACEHOLDER = '__KEEP_EXISTING__';
 
 const LOCALE_MAP = {
@@ -37,7 +37,16 @@ const LOCALE_MAP = {
     "app_url": { title: "应用地址", desc: "当前 Grok2API 服务的外部访问 URL，用于文件链接访问。" },
     "image_format": { title: "图片格式", desc: "生成的图片格式（url / base64 / b64_json）。" },
     "video_format": { title: "视频格式", desc: "生成的视频格式（仅支持 url）。" },
-    "upload_max_image_mb": { title: "上传大小上限", desc: "前端上传图片接口的单文件大小上限（MB）。" }
+    "upload_max_image_mb": { title: "上传大小上限", desc: "前端上传图片接口的单文件大小上限（MB）。" },
+    "linuxdo_oauth_enabled": { title: "启用 Linux.do 登录", desc: "启用后，登录页会在配置完整时展示 Linux.do 第三方登录入口。" },
+    "linuxdo_client_id": { title: "Linux.do Client ID", desc: "Linux.do OAuth 应用的客户端 ID。" },
+    "linuxdo_client_secret": { title: "Linux.do Client Secret", desc: "Linux.do OAuth 应用的客户端密钥，留空表示保留现有值。" },
+    "linuxdo_authorize_url": { title: "授权地址", desc: "Linux.do OAuth 授权端点完整 URL。" },
+    "linuxdo_token_url": { title: "令牌地址", desc: "Linux.do OAuth token 交换端点完整 URL。" },
+    "linuxdo_userinfo_url": { title: "用户信息地址", desc: "Linux.do OAuth userinfo 端点完整 URL。" },
+    "linuxdo_scope": { title: "授权范围", desc: "授权请求使用的 scope，留空时由后端使用默认值。" },
+    "linuxdo_allowed_sub": { title: "允许的 Sub", desc: "允许登录后台的 Linux.do 用户 sub，多个值可用英文逗号分隔。" },
+    "linuxdo_allowed_username": { title: "允许的用户名", desc: "允许登录后台的 Linux.do 用户名，多个值可用英文逗号分隔。" }
   },
   "grok": {
     "label": "Grok 设置",
@@ -298,7 +307,7 @@ function renderConfig(data) {
         input.dataset.section = section;
         input.dataset.key = key;
 
-        if (key === 'app_key') input.type = 'password';
+        if (key === 'app_key' || key === 'linuxdo_client_secret') input.type = 'password';
         if (isSecret && isSecretSet) input.placeholder = '已设置，留空表示不修改';
 
         if (key === 'api_key' || key === 'app_key') {

@@ -25,6 +25,15 @@ api_key = ""
 image_format = "url"
 video_format = "url"
 upload_max_image_mb = 25
+linuxdo_oauth_enabled = false
+linuxdo_client_id = ""
+linuxdo_client_secret = ""
+linuxdo_authorize_url = ""
+linuxdo_token_url = ""
+linuxdo_userinfo_url = ""
+linuxdo_scope = ""
+linuxdo_allowed_sub = ""
+linuxdo_allowed_username = ""
 
 [token]
 auto_refresh = true

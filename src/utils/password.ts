@@ -1,6 +1,8 @@
 const HASH_PREFIX = "pbkdf2_sha256";
-const DEFAULT_ITERATIONS = 310000;
+const DEFAULT_ITERATIONS = 100000;
+const MAX_NATIVE_ITERATIONS = 100000;
 const SALT_BYTES = 16;
+const DERIVED_BYTES = 32;
 
 function base64UrlEncode(bytes: Uint8Array): string {
   let binary = "";
@@ -21,17 +23,77 @@ function base64UrlDecode(input: string): Uint8Array {
   return out;
 }
 
-async function derive(secret: string, salt: Uint8Array, iterations: number): Promise<Uint8Array> {
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+}
+
+async function importPbkdf2Key(secret: string): Promise<CryptoKey> {
   const encoded = new TextEncoder().encode(secret);
-  const raw = encoded.buffer.slice(encoded.byteOffset, encoded.byteOffset + encoded.byteLength) as ArrayBuffer;
-  const saltBuffer = salt.buffer.slice(salt.byteOffset, salt.byteOffset + salt.byteLength) as ArrayBuffer;
-  const key = await crypto.subtle.importKey("raw", raw, "PBKDF2", false, ["deriveBits"]);
+  return crypto.subtle.importKey("raw", toArrayBuffer(encoded), "PBKDF2", false, ["deriveBits"]);
+}
+
+async function importHmacKey(secret: string): Promise<CryptoKey> {
+  const encoded = new TextEncoder().encode(secret);
+  return crypto.subtle.importKey(
+    "raw",
+    toArrayBuffer(encoded),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+}
+
+async function deriveNative(secret: string, salt: Uint8Array, iterations: number): Promise<Uint8Array> {
+  const key = await importPbkdf2Key(secret);
   const bits = await crypto.subtle.deriveBits(
-    { name: "PBKDF2", hash: "SHA-256", salt: saltBuffer, iterations },
+    { name: "PBKDF2", hash: "SHA-256", salt: toArrayBuffer(salt), iterations },
     key,
-    256,
+    DERIVED_BYTES * 8,
   );
   return new Uint8Array(bits);
+}
+
+async function hmacSha256(key: CryptoKey, data: Uint8Array): Promise<Uint8Array> {
+  const signed = await crypto.subtle.sign("HMAC", key, toArrayBuffer(data));
+  return new Uint8Array(signed);
+}
+
+async function deriveManual(secret: string, salt: Uint8Array, iterations: number): Promise<Uint8Array> {
+  const key = await importHmacKey(secret);
+  const block = new Uint8Array(salt.length + 4);
+  block.set(salt, 0);
+  block[block.length - 1] = 1;
+
+  let u = await hmacSha256(key, block);
+  const output = new Uint8Array(u);
+  for (let i = 1; i < iterations; i += 1) {
+    u = await hmacSha256(key, u);
+    for (let j = 0; j < output.length; j += 1) {
+      const current = output[j] ?? 0;
+      const next = u[j] ?? 0;
+      output[j] = current ^ next;
+    }
+  }
+  return output;
+}
+
+async function derive(secret: string, salt: Uint8Array, iterations: number): Promise<Uint8Array> {
+  if (iterations <= MAX_NATIVE_ITERATIONS) {
+    return deriveNative(secret, salt, iterations);
+  }
+  return deriveManual(secret, salt, iterations);
+}
+
+function parsePasswordHash(hash: string): { iterations: number; saltText: string; digestText: string } | null {
+  const [prefix, iterationText, saltText, digestText] = hash.split("$");
+  if (prefix !== HASH_PREFIX || !iterationText || !saltText || !digestText) return null;
+  const iterations = Number(iterationText);
+  if (!Number.isFinite(iterations) || iterations <= 0) return null;
+  return {
+    iterations: Math.floor(iterations),
+    saltText,
+    digestText,
+  };
 }
 
 export async function hashPassword(secret: string, iterations = DEFAULT_ITERATIONS): Promise<string> {
@@ -45,6 +107,11 @@ export function hasPasswordHash(storedHash: string | null | undefined): boolean 
   return String(storedHash ?? "").startsWith(`${HASH_PREFIX}$`);
 }
 
+export function passwordHashNeedsUpgrade(storedHash: string | null | undefined): boolean {
+  const parsed = parsePasswordHash(String(storedHash ?? "").trim());
+  return Boolean(parsed && parsed.iterations !== DEFAULT_ITERATIONS);
+}
+
 export async function verifyPassword(
   secret: string,
   storedHash: string | null | undefined,
@@ -53,14 +120,11 @@ export async function verifyPassword(
   const candidate = String(secret ?? "");
   const hash = String(storedHash ?? "").trim();
   if (hash) {
-    const [prefix, iterationText, saltText, digestText] = hash.split("$");
-    if (prefix === HASH_PREFIX && iterationText && saltText && digestText) {
-      const iterations = Number(iterationText);
-      if (Number.isFinite(iterations) && iterations > 0) {
-        const salt = base64UrlDecode(saltText);
-        const expected = base64UrlEncode(await derive(candidate, salt, Math.floor(iterations)));
-        return expected === digestText;
-      }
+    const parsed = parsePasswordHash(hash);
+    if (parsed) {
+      const salt = base64UrlDecode(parsed.saltText);
+      const expected = base64UrlEncode(await derive(candidate, salt, parsed.iterations));
+      return expected === parsed.digestText;
     }
   }
   return candidate === String(legacyPlaintext ?? "");

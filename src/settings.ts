@@ -11,6 +11,15 @@ export interface GlobalSettings {
   admin_password_hash?: string;
   image_cache_max_size_mb?: number;
   video_cache_max_size_mb?: number;
+  linuxdo_oauth_enabled?: boolean;
+  linuxdo_client_id?: string;
+  linuxdo_client_secret?: string;
+  linuxdo_authorize_url?: string;
+  linuxdo_token_url?: string;
+  linuxdo_userinfo_url?: string;
+  linuxdo_scope?: string;
+  linuxdo_allowed_sub?: string;
+  linuxdo_allowed_username?: string;
 }
 
 export interface GrokSettings {
@@ -96,6 +105,15 @@ const DEFAULTS: SettingsBundle = {
     admin_password_hash: "",
     image_cache_max_size_mb: 512,
     video_cache_max_size_mb: 1024,
+    linuxdo_oauth_enabled: false,
+    linuxdo_client_id: "",
+    linuxdo_client_secret: "",
+    linuxdo_authorize_url: "https://connect.linux.do/oauth2/authorize",
+    linuxdo_token_url: "https://connect.linux.do/oauth2/token",
+    linuxdo_userinfo_url: "https://connect.linux.do/api/user",
+    linuxdo_scope: "",
+    linuxdo_allowed_sub: "",
+    linuxdo_allowed_username: "",
   },
   grok: {
     api_key: "",

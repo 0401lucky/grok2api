@@ -56,18 +56,27 @@ import {
 import { dbAll, dbFirst, dbRun } from "../db";
 import { nowMs } from "../utils/time";
 import { listUsageForDay, localDayString } from "../repo/apiKeyUsage";
-import { hasPasswordHash, hashPassword, verifyPassword } from "../utils/password";
+import { hasPasswordHash, hashPassword, passwordHashNeedsUpgrade, verifyPassword } from "../utils/password";
 
 const ADMIN_SESSION_COOKIE = "g2a_admin_session";
 const ADMIN_SECRET_PLACEHOLDER = "__KEEP_EXISTING__";
 const LOGIN_WINDOW_MS = 10 * 60 * 1000;
 const LOGIN_LOCK_MS = 10 * 60 * 1000;
 const LOGIN_MAX_ATTEMPTS = 5;
+const LINUXDO_STATE_COOKIE = "g2a_linuxdo_state";
+const LINUXDO_STATE_TTL_SECONDS = 10 * 60;
+const LINUXDO_DEFAULT_SCOPE = "openid profile email";
 
 type LoginAttemptState = {
   count: number;
   firstAt: number;
   lockedUntil: number;
+};
+
+type LinuxdoUserInfo = {
+  sub: string;
+  username: string;
+  raw: Record<string, unknown>;
 };
 
 const adminLoginAttempts = new Map<string, LoginAttemptState>();
@@ -105,9 +114,18 @@ async function verifyStoredAdminPassword(storedHash: string | undefined, legacyP
   return verifyPassword(input, storedHash, legacyPlain);
 }
 
-async function isPlaceholderBootstrap(storedHash: string | undefined, legacyPlain: string | undefined, input: string): Promise<boolean> {
-  if (String(input ?? "").trim() !== "__CHANGE_ME__") return false;
-  return verifyStoredAdminPassword(storedHash, legacyPlain, "__CHANGE_ME__");
+async function maybeUpgradeAdminPasswordHash(
+  env: Env,
+  storedHash: string | undefined,
+  password: string,
+): Promise<void> {
+  if (!passwordHashNeedsUpgrade(storedHash)) return;
+  await saveSettings(env, {
+    global_config: {
+      admin_password_hash: await hashPassword(password),
+      admin_password: "",
+    },
+  });
 }
 
 function getAdminSessionCookieOptions(c: any): {
@@ -126,6 +144,166 @@ function getAdminSessionCookieOptions(c: any): {
     maxAge: 8 * 60 * 60,
   };
 }
+
+function getLinuxdoStateCookieOptions(c: any): {
+  path: string;
+  httpOnly: boolean;
+  sameSite: "Lax";
+  secure: boolean;
+  maxAge: number;
+} {
+  return {
+    ...getAdminSessionCookieOptions(c),
+    maxAge: LINUXDO_STATE_TTL_SECONDS,
+  };
+}
+
+function splitAllowlistValues(raw: string | undefined): string[] {
+  return String(raw ?? "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function normalizeLoginReturnTo(raw: string | null | undefined): string {
+  const value = String(raw ?? "").trim();
+  if (!value) return "/admin/token";
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol || parsed.host) return "/admin/token";
+  } catch {
+    // ignore absolute url parse failure and continue with relative parsing
+  }
+  if (!value.startsWith("/") || value.startsWith("//")) return "/admin/token";
+  return value;
+}
+
+function resolveLinuxdoBaseUrl(c: any, settings: Awaited<ReturnType<typeof getSettings>>): string {
+  const configured = String(settings.global.base_url ?? "").trim();
+  if (configured) return configured.replace(/\/+$/, "");
+  const url = new URL(c.req.url);
+  return url.origin;
+}
+
+function resolveLinuxdoCallbackUrl(c: any, settings: Awaited<ReturnType<typeof getSettings>>): string {
+  return `${resolveLinuxdoBaseUrl(c, settings)}/api/v1/admin/login/linuxdo/callback`;
+}
+
+function getLinuxdoConfiguredState(c: any, settings: Awaited<ReturnType<typeof getSettings>>): { enabled: boolean; configured: boolean } {
+  const enabled = Boolean(settings.global.linuxdo_oauth_enabled);
+  const required = [
+    settings.global.linuxdo_client_id,
+    settings.global.linuxdo_client_secret,
+    settings.global.linuxdo_authorize_url,
+    settings.global.linuxdo_token_url,
+    settings.global.linuxdo_userinfo_url,
+  ].every((value) => String(value ?? "").trim());
+  const hasAllowlist =
+    splitAllowlistValues(settings.global.linuxdo_allowed_sub).length > 0 ||
+    splitAllowlistValues(settings.global.linuxdo_allowed_username).length > 0;
+  const callbackUrl = resolveLinuxdoCallbackUrl(c, settings);
+  return {
+    enabled,
+    configured: enabled && required && hasAllowlist && Boolean(callbackUrl),
+  };
+}
+
+function buildLinuxdoState(returnTo: string): string {
+  const payload = {
+    nonce: crypto.randomUUID(),
+    return_to: normalizeLoginReturnTo(returnTo),
+  };
+  return btoa(JSON.stringify(payload)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function parseLinuxdoState(raw: string | null | undefined): { nonce: string; returnTo: string } | null {
+  const text = String(raw ?? "").trim();
+  if (!text) return null;
+  const normalized = text.replace(/-/g, "+").replace(/_/g, "/");
+  const padding = normalized.length % 4 ? "=".repeat(4 - (normalized.length % 4)) : "";
+  try {
+    const payload = JSON.parse(atob(normalized + padding)) as Record<string, unknown>;
+    const nonce = String(payload.nonce ?? "").trim();
+    if (!nonce) return null;
+    return {
+      nonce,
+      returnTo: normalizeLoginReturnTo(String(payload.return_to ?? "")),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function buildLoginRedirectUrl(c: any, code: string, description?: string): string {
+  const url = new URL("/login", c.req.url);
+  url.searchParams.set("error", code);
+  const detail = String(description ?? "").trim();
+  if (detail) {
+    url.searchParams.set("error_description", detail);
+  }
+  return url.pathname + url.search;
+}
+
+async function fetchLinuxdoUserInfo(
+  settings: Awaited<ReturnType<typeof getSettings>>,
+  code: string,
+  redirectUri: string,
+): Promise<LinuxdoUserInfo> {
+  const clientId = String(settings.global.linuxdo_client_id ?? "").trim();
+  const clientSecret = String(settings.global.linuxdo_client_secret ?? "").trim();
+  const tokenUrl = String(settings.global.linuxdo_token_url ?? "").trim();
+  const userinfoUrl = String(settings.global.linuxdo_userinfo_url ?? "").trim();
+  if (!clientId || !clientSecret || !tokenUrl || !userinfoUrl) {
+    throw new Error("oauth_not_configured");
+  }
+
+  const tokenResp = await fetch(tokenUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Accept: "application/json",
+    },
+    body: new URLSearchParams({
+      grant_type: "authorization_code",
+      code,
+      client_id: clientId,
+      client_secret: clientSecret,
+      redirect_uri: redirectUri,
+    }),
+  });
+  const tokenData = (await tokenResp.json().catch(() => ({}))) as Record<string, unknown>;
+  const accessToken = String(tokenData.access_token ?? "").trim();
+  if (!tokenResp.ok || !accessToken) {
+    throw new Error("token_exchange_failed");
+  }
+
+  const userResp = await fetch(userinfoUrl, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: "application/json",
+    },
+  });
+  const userData = (await userResp.json().catch(() => ({}))) as Record<string, unknown>;
+  if (!userResp.ok) {
+    throw new Error("userinfo_failed");
+  }
+
+  const sub = String(userData.sub ?? userData.id ?? "").trim();
+  const username = String(userData.username ?? userData.login ?? userData.name ?? "").trim();
+  if (!sub && !username) {
+    throw new Error("userinfo_failed");
+  }
+  return { sub, username, raw: userData };
+}
+
+function isLinuxdoUserAllowed(settings: Awaited<ReturnType<typeof getSettings>>, user: LinuxdoUserInfo): boolean {
+  const allowedSubs = splitAllowlistValues(settings.global.linuxdo_allowed_sub);
+  const allowedUsernames = splitAllowlistValues(settings.global.linuxdo_allowed_username).map((item) => item.toLowerCase());
+  const subMatch = Boolean(user.sub) && allowedSubs.includes(user.sub);
+  const usernameMatch = Boolean(user.username) && allowedUsernames.includes(user.username.toLowerCase());
+  return subMatch || usernameMatch;
+}
+
 
 function getClientIp(c: any): string {
   const forwarded = String(c.req.header("CF-Connecting-IP") ?? c.req.header("X-Forwarded-For") ?? "").trim();
@@ -176,7 +354,7 @@ function extractCookieToken(c: any): string {
 
 function isSensitiveConfigKey(section: string, key: string): boolean {
   return (
-    (section === "app" && (key === "app_key" || key === "api_key")) ||
+    (section === "app" && (key === "app_key" || key === "api_key" || key === "linuxdo_client_secret")) ||
     (section === "grok" && (key === "cf_clearance" || key === "wreq_emulation_nsfw")) ||
     (section === "register" && (key === "admin_password" || key === "yescaptcha_key"))
   );
@@ -421,24 +599,17 @@ adminRoutes.post("/api/v1/admin/login", async (c) => {
       return c.json({ ...legacyErr("Too many login attempts. Please try again later."), retry_after: retryAfter }, 429);
     }
 
-    const weakAdminPassword = await isWeakStoredAdminPassword(
-      settings.global.admin_password_hash,
-      settings.global.admin_password,
-    );
-    const placeholderBootstrap = await isPlaceholderBootstrap(
-      settings.global.admin_password_hash,
-      settings.global.admin_password,
-      password,
-    );
-    if (weakAdminPassword && !allowWeakAdminPassword(c) && !placeholderBootstrap) {
-      return c.json(legacyErr("Admin password is weak or not initialized. Please set a strong password first."), 503);
-    }
-
     const passwordOk = await verifyStoredAdminPassword(
       settings.global.admin_password_hash,
       settings.global.admin_password,
       password,
     );
+    const placeholderBootstrap = passwordOk && String(password).trim() === "__CHANGE_ME__";
+    const weakAdminPassword = passwordOk ? isWeakAdminPassword(password) : false;
+    if (weakAdminPassword && !allowWeakAdminPassword(c) && !placeholderBootstrap) {
+      return c.json(legacyErr("Admin password is weak or not initialized. Please set a strong password first."), 503);
+    }
+
     if (username !== settings.global.admin_username || !passwordOk) {
       const lockedFor = recordLoginFailure(clientKey, now);
       if (lockedFor) {
@@ -448,6 +619,11 @@ adminRoutes.post("/api/v1/admin/login", async (c) => {
     }
 
     clearLoginFailure(clientKey);
+    await maybeUpgradeAdminPasswordHash(
+      c.env,
+      settings.global.admin_password_hash,
+      password,
+    );
     if (!settings.global.admin_password_hash && settings.global.admin_password) {
       await saveSettings(c.env, {
         global_config: {
@@ -462,6 +638,92 @@ adminRoutes.post("/api/v1/admin/login", async (c) => {
     return c.json({ status: "success", password_reset_required: weakAdminPassword && placeholderBootstrap });
   } catch (e) {
     return c.json(legacyErr(`Login error: ${e instanceof Error ? e.message : String(e)}`), 500);
+  }
+});
+
+adminRoutes.get("/api/v1/admin/login/options", async (c) => {
+  try {
+    const settings = await getSettings(c.env);
+    const linuxdo = getLinuxdoConfiguredState(c, settings);
+    return c.json({
+      password_login_enabled: true,
+      linuxdo,
+    });
+  } catch (e) {
+    return c.json(legacyErr(`Get login options failed: ${e instanceof Error ? e.message : String(e)}`), 500);
+  }
+});
+
+adminRoutes.get("/api/v1/admin/login/linuxdo", async (c) => {
+  const settings = await getSettings(c.env);
+  const linuxdo = getLinuxdoConfiguredState(c, settings);
+  if (!linuxdo.enabled) {
+    return c.redirect(buildLoginRedirectUrl(c, "oauth_disabled"), 302);
+  }
+  if (!linuxdo.configured) {
+    return c.redirect(buildLoginRedirectUrl(c, "oauth_not_configured"), 302);
+  }
+
+  const state = buildLinuxdoState(c.req.query("return_to") ?? "/admin/token");
+  const authorizeUrl = new URL(String(settings.global.linuxdo_authorize_url ?? "").trim());
+  authorizeUrl.searchParams.set("client_id", String(settings.global.linuxdo_client_id ?? "").trim());
+  authorizeUrl.searchParams.set("response_type", "code");
+  authorizeUrl.searchParams.set("redirect_uri", resolveLinuxdoCallbackUrl(c, settings));
+  authorizeUrl.searchParams.set("scope", String(settings.global.linuxdo_scope ?? "").trim() || LINUXDO_DEFAULT_SCOPE);
+  authorizeUrl.searchParams.set("state", state);
+
+  setCookie(c, LINUXDO_STATE_COOKIE, state, getLinuxdoStateCookieOptions(c));
+  return c.redirect(authorizeUrl.toString(), 302);
+});
+
+adminRoutes.get("/api/v1/admin/login/linuxdo/callback", async (c) => {
+  const settings = await getSettings(c.env);
+  const linuxdo = getLinuxdoConfiguredState(c, settings);
+  if (!linuxdo.enabled) {
+    return c.redirect(buildLoginRedirectUrl(c, "oauth_disabled"), 302);
+  }
+  if (!linuxdo.configured) {
+    return c.redirect(buildLoginRedirectUrl(c, "oauth_not_configured"), 302);
+  }
+
+  const upstreamError = String(c.req.query("error") ?? "").trim();
+  if (upstreamError) {
+    const upstreamDescription = String(c.req.query("error_description") ?? "").trim();
+    return c.redirect(buildLoginRedirectUrl(c, upstreamError, upstreamDescription), 302);
+  }
+
+  const savedState = parseLinuxdoState(getCookie(c, LINUXDO_STATE_COOKIE) ?? null);
+  if (!savedState) {
+    return c.redirect(buildLoginRedirectUrl(c, "state_missing"), 302);
+  }
+
+  const state = String(c.req.query("state") ?? "").trim();
+  if (!state || state !== String(getCookie(c, LINUXDO_STATE_COOKIE) ?? "").trim()) {
+    deleteCookie(c, LINUXDO_STATE_COOKIE, { path: "/" });
+    return c.redirect(buildLoginRedirectUrl(c, "state_mismatch"), 302);
+  }
+
+  const code = String(c.req.query("code") ?? "").trim();
+  if (!code) {
+    deleteCookie(c, LINUXDO_STATE_COOKIE, { path: "/" });
+    return c.redirect(buildLoginRedirectUrl(c, "missing_code"), 302);
+  }
+
+  try {
+    const user = await fetchLinuxdoUserInfo(settings, code, resolveLinuxdoCallbackUrl(c, settings));
+    if (!isLinuxdoUserAllowed(settings, user)) {
+      deleteCookie(c, LINUXDO_STATE_COOKIE, { path: "/" });
+      return c.redirect(buildLoginRedirectUrl(c, "allowlist_denied"), 302);
+    }
+
+    const token = await createAdminSession(c.env.DB);
+    deleteCookie(c, LINUXDO_STATE_COOKIE, { path: "/" });
+    setCookie(c, ADMIN_SESSION_COOKIE, token, getAdminSessionCookieOptions(c));
+    return c.redirect(savedState.returnTo, 302);
+  } catch (e) {
+    deleteCookie(c, LINUXDO_STATE_COOKIE, { path: "/" });
+    const code = e instanceof Error ? e.message : "userinfo_failed";
+    return c.redirect(buildLoginRedirectUrl(c, code), 302);
   }
 });
 
@@ -486,6 +748,16 @@ adminRoutes.get("/api/v1/admin/config", requireAdminAuth, async (c) => {
         app_url: settings.global.base_url ?? "",
         image_format: settings.global.image_mode ?? "url",
         video_format: "url",
+        linuxdo_oauth_enabled: Boolean(settings.global.linuxdo_oauth_enabled),
+        linuxdo_client_id: settings.global.linuxdo_client_id ?? "",
+        linuxdo_client_secret: redactSecret(settings.global.linuxdo_client_secret),
+        linuxdo_client_secret_set: Boolean(settings.global.linuxdo_client_secret),
+        linuxdo_authorize_url: settings.global.linuxdo_authorize_url ?? "",
+        linuxdo_token_url: settings.global.linuxdo_token_url ?? "",
+        linuxdo_userinfo_url: settings.global.linuxdo_userinfo_url ?? "",
+        linuxdo_scope: settings.global.linuxdo_scope ?? "",
+        linuxdo_allowed_sub: settings.global.linuxdo_allowed_sub ?? "",
+        linuxdo_allowed_username: settings.global.linuxdo_allowed_username ?? "",
       },
       grok: {
         temporary: Boolean(settings.grok.temporary),
@@ -587,6 +859,18 @@ adminRoutes.post("/api/v1/admin/config", requireAdminAuth, async (c) => {
       if (typeof appCfg.app_url === "string") global_config.base_url = appCfg.app_url.trim();
       if (appCfg.image_format === "url" || appCfg.image_format === "base64" || appCfg.image_format === "b64_json")
         global_config.image_mode = appCfg.image_format;
+      if (typeof appCfg.linuxdo_oauth_enabled === "boolean") global_config.linuxdo_oauth_enabled = appCfg.linuxdo_oauth_enabled;
+      if (typeof appCfg.linuxdo_client_id === "string") global_config.linuxdo_client_id = appCfg.linuxdo_client_id.trim();
+      if (typeof appCfg.linuxdo_client_secret === "string") {
+        const value = appCfg.linuxdo_client_secret.trim();
+        if (value && value !== ADMIN_SECRET_PLACEHOLDER) global_config.linuxdo_client_secret = value;
+      }
+      if (typeof appCfg.linuxdo_authorize_url === "string") global_config.linuxdo_authorize_url = appCfg.linuxdo_authorize_url.trim();
+      if (typeof appCfg.linuxdo_token_url === "string") global_config.linuxdo_token_url = appCfg.linuxdo_token_url.trim();
+      if (typeof appCfg.linuxdo_userinfo_url === "string") global_config.linuxdo_userinfo_url = appCfg.linuxdo_userinfo_url.trim();
+      if (typeof appCfg.linuxdo_scope === "string") global_config.linuxdo_scope = appCfg.linuxdo_scope.trim();
+      if (typeof appCfg.linuxdo_allowed_sub === "string") global_config.linuxdo_allowed_sub = appCfg.linuxdo_allowed_sub.trim();
+      if (typeof appCfg.linuxdo_allowed_username === "string") global_config.linuxdo_allowed_username = appCfg.linuxdo_allowed_username.trim();
     }
 
     if (grokCfg && typeof grokCfg === "object") {
@@ -1572,24 +1856,17 @@ adminRoutes.post("/api/login", async (c) => {
       return c.json({ success: false, message: "登录过于频繁，请稍后再试", retry_after: retryAfter }, 429);
     }
 
-    const weakAdminPassword = await isWeakStoredAdminPassword(
-      settings.global.admin_password_hash,
-      settings.global.admin_password,
-    );
-    const placeholderBootstrap = await isPlaceholderBootstrap(
-      settings.global.admin_password_hash,
-      settings.global.admin_password,
-      String(body.password ?? ""),
-    );
-    if (weakAdminPassword && !allowWeakAdminPassword(c) && !placeholderBootstrap) {
-      return c.json({ success: false, message: "管理员密码过弱或未初始化，请先设置强密码" }, 503);
-    }
-
     const passwordOk = await verifyStoredAdminPassword(
       settings.global.admin_password_hash,
       settings.global.admin_password,
       String(body.password ?? ""),
     );
+    const placeholderBootstrap = passwordOk && String(body.password ?? "").trim() === "__CHANGE_ME__";
+    const weakAdminPassword = passwordOk ? isWeakAdminPassword(String(body.password ?? "")) : false;
+    if (weakAdminPassword && !allowWeakAdminPassword(c) && !placeholderBootstrap) {
+      return c.json({ success: false, message: "管理员密码过弱或未初始化，请先设置强密码" }, 503);
+    }
+
     if (body.username !== settings.global.admin_username || !passwordOk) {
       const lockedFor = recordLoginFailure(clientKey, now);
       if (lockedFor) {
@@ -1599,6 +1876,11 @@ adminRoutes.post("/api/login", async (c) => {
     }
 
     clearLoginFailure(clientKey);
+    await maybeUpgradeAdminPasswordHash(
+      c.env,
+      settings.global.admin_password_hash,
+      String(body.password ?? ""),
+    );
     const token = await createAdminSession(c.env.DB);
     setCookie(c, ADMIN_SESSION_COOKIE, token, getAdminSessionCookieOptions(c));
     return c.json({ success: true, message: "登录成功", password_reset_required: weakAdminPassword && placeholderBootstrap });

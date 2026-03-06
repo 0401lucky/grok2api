@@ -1,5 +1,5 @@
 ﻿from fastapi import APIRouter, Depends, HTTPException, Request, Query, Body, WebSocket
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel
 from typing import Any, Optional
 
@@ -12,15 +12,18 @@ from app.core.admin_session import (
     verify_admin_session_token,
     revoke_admin_session_token,
 )
+import base64
 import os
 from pathlib import Path
 import aiofiles
 import asyncio
 import json
+import secrets
 import time
 import uuid
+import httpx
 import orjson
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 from app.core.logger import logger
 from app.core.security import (
@@ -50,6 +53,12 @@ from app.services.token import get_token_manager
 router = APIRouter()
 
 TEMPLATE_DIR = Path(__file__).parent.parent.parent / "static"
+LINUXDO_OAUTH_AUTHORIZE_URL = "https://connect.linux.do/oauth2/authorize"
+LINUXDO_OAUTH_TOKEN_URL = "https://connect.linux.do/oauth2/token"
+LINUXDO_OAUTH_USERINFO_URL = "https://connect.linux.do/api/user"
+LINUXDO_OAUTH_SCOPE = "openid profile email"
+LINUXDO_STATE_COOKIE = "g2a_linuxdo_state"
+LINUXDO_STATE_TTL_SECONDS = 600
 
 
 class AdminLoginBody(BaseModel):
@@ -113,7 +122,7 @@ def _session_cookie_secure(request: Request) -> bool:
     return str(request.url.scheme).lower() == "https"
 
 
-def _set_admin_session_cookie(response: JSONResponse, request: Request, token: str, ttl_hours: int) -> None:
+def _set_admin_session_cookie(response: Response, request: Request, token: str, ttl_hours: int) -> None:
     response.set_cookie(
         ADMIN_SESSION_COOKIE,
         token,
@@ -125,8 +134,171 @@ def _set_admin_session_cookie(response: JSONResponse, request: Request, token: s
     )
 
 
-def _clear_admin_session_cookie(response: JSONResponse) -> None:
+def _clear_admin_session_cookie(response: Response) -> None:
     response.delete_cookie(ADMIN_SESSION_COOKIE, path="/")
+
+
+def _set_linuxdo_state_cookie(response: Response, request: Request, state: str) -> None:
+    response.set_cookie(
+        LINUXDO_STATE_COOKIE,
+        state,
+        max_age=LINUXDO_STATE_TTL_SECONDS,
+        httponly=True,
+        samesite="lax",
+        secure=_session_cookie_secure(request),
+        path="/",
+    )
+
+
+def _clear_linuxdo_state_cookie(response: Response) -> None:
+    response.delete_cookie(LINUXDO_STATE_COOKIE, path="/")
+
+
+def _resolve_admin_session_ttl_hours() -> int:
+    try:
+        session_ttl_hours = int(get_config("app.admin_session_ttl_hours", 8) or 8)
+    except Exception:
+        session_ttl_hours = 8
+    return max(1, min(72, session_ttl_hours))
+
+
+def _issue_admin_session_response(
+    request: Request,
+    *,
+    admin_username: str,
+    weak_admin_password: bool = False,
+    placeholder_bootstrap: bool = False,
+    redirect_to: str | None = None,
+) -> Response:
+    session_ttl_hours = _resolve_admin_session_ttl_hours()
+    session_token = create_admin_session_token(admin_username, ttl_hours=session_ttl_hours)
+    if redirect_to:
+        response: Response = RedirectResponse(url=redirect_to, status_code=302)
+    else:
+        response = JSONResponse({"status": "success", "password_reset_required": weak_admin_password and placeholder_bootstrap})
+    _set_admin_session_cookie(response, request, session_token, session_ttl_hours)
+    return response
+
+
+def _normalize_login_return_to(raw: str | None) -> str:
+    value = str(raw or "").strip()
+    if not value:
+        return "/admin/token"
+    parsed = urlparse(value)
+    if parsed.scheme or parsed.netloc:
+        return "/admin/token"
+    path = parsed.path or "/admin/token"
+    if not path.startswith("/") or path.startswith("//"):
+        return "/admin/token"
+    return path + ((f"?{parsed.query}") if parsed.query else "")
+
+
+def _config_bool(key: str, default: bool = False) -> bool:
+    raw = get_config(key, default)
+    if isinstance(raw, bool):
+        return raw
+    return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _linuxdo_configured() -> bool:
+    client_id = str(get_config("app.linuxdo_client_id", "") or "").strip()
+    client_secret = str(get_config("app.linuxdo_client_secret", "") or "").strip()
+    return bool(client_id and client_secret)
+
+
+def _linuxdo_enabled() -> bool:
+    return _config_bool("app.linuxdo_oauth_enabled", False)
+
+
+def _build_linuxdo_login_error_response(error: str, error_description: str | None = None) -> RedirectResponse:
+    params = {"error": str(error or "oauth_disabled").strip() or "oauth_disabled"}
+    description = str(error_description or "").strip()
+    if description:
+        params["error_description"] = description
+    return RedirectResponse(url=f"/login?{urlencode(params)}", status_code=302)
+
+
+def _build_linuxdo_redirect_uri(request: Request) -> str:
+    configured = str(get_config("app.app_url", "") or "").strip().rstrip("/")
+    callback_path = "/api/v1/admin/login/linuxdo/callback"
+    if configured:
+        return f"{configured}{callback_path}"
+    return str(request.url_for("admin_login_linuxdo_callback"))
+
+
+def _encode_linuxdo_state(return_to: str) -> str:
+    payload = {
+        "nonce": secrets.token_urlsafe(16),
+        "return_to": _normalize_login_return_to(return_to),
+    }
+    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("utf-8").rstrip("=")
+
+
+def _decode_linuxdo_state(raw: str | None) -> dict[str, str] | None:
+    state = str(raw or "").strip()
+    if not state:
+        return None
+    padding = "=" * (-len(state) % 4)
+    try:
+        payload = json.loads(base64.urlsafe_b64decode((state + padding).encode("utf-8")).decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    nonce = str(payload.get("nonce") or "").strip()
+    return_to = _normalize_login_return_to(payload.get("return_to"))
+    if not nonce:
+        return None
+    return {"nonce": nonce, "return_to": return_to}
+
+
+async def _fetch_linuxdo_userinfo(code: str, redirect_uri: str) -> dict[str, Any]:
+    client_id = str(get_config("app.linuxdo_client_id", "") or "").strip()
+    client_secret = str(get_config("app.linuxdo_client_secret", "") or "").strip()
+    if not client_id or not client_secret:
+        raise HTTPException(status_code=503, detail="Linux.do 登录未配置")
+
+    token_url = str(get_config("app.linuxdo_token_url", "") or "").strip() or LINUXDO_OAUTH_TOKEN_URL
+    userinfo_url = str(get_config("app.linuxdo_userinfo_url", "") or "").strip() or LINUXDO_OAUTH_USERINFO_URL
+
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
+        token_resp = await client.post(
+            token_url,
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "redirect_uri": redirect_uri,
+            },
+            headers={"Accept": "application/json"},
+        )
+        try:
+            token_data = token_resp.json()
+        except Exception:
+            token_data = {}
+        if token_resp.status_code >= 400:
+            detail = str(token_data.get("error_description") or token_data.get("error") or "Linux.do 令牌交换失败")
+            raise HTTPException(status_code=502, detail=detail)
+        access_token = str(token_data.get("access_token") or "").strip()
+        if not access_token:
+            raise HTTPException(status_code=502, detail="Linux.do 未返回 access_token")
+
+        user_resp = await client.get(
+            userinfo_url,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Accept": "application/json",
+            },
+        )
+        try:
+            user_data = user_resp.json()
+        except Exception:
+            user_data = {}
+        if user_resp.status_code >= 400 or not isinstance(user_data, dict):
+            raise HTTPException(status_code=502, detail="Linux.do 用户信息获取失败")
+        return user_data
 
 
 def _sanitize_config_for_admin_response(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -139,6 +311,9 @@ def _sanitize_config_for_admin_response(cfg: dict[str, Any]) -> dict[str, Any]:
     app_cfg["app_key_set"] = bool(app_secret)
     app_cfg["api_key"] = redact_secret(str(app_cfg.get("api_key") or ""))
     app_cfg["api_key_set"] = bool(str(app_cfg.get("api_key") or ""))
+    linuxdo_secret = str(app_cfg.get("linuxdo_client_secret") or "")
+    app_cfg["linuxdo_client_secret"] = redact_secret(linuxdo_secret)
+    app_cfg["linuxdo_client_secret_set"] = bool(linuxdo_secret)
 
     for key in ("cf_clearance", "wreq_emulation_nsfw"):
         value = str(grok_cfg.get(key) or "")
@@ -546,15 +721,105 @@ async def admin_login_api(request: Request, body: AdminLoginBody | None = Body(d
     if not admin_password_hash and admin_password:
         await config.update({"app": {"app_key_hash": hash_password(admin_password), "app_key": ""}})
 
-    session_ttl_hours = 8
+    return _issue_admin_session_response(
+        request,
+        admin_username=admin_username,
+        weak_admin_password=weak_admin_password,
+        placeholder_bootstrap=placeholder_bootstrap,
+    )
+
+
+@router.get("/api/v1/admin/login/options")
+async def admin_login_options_api():
+    return {
+        "password": True,
+        "linuxdo": {
+            "enabled": _linuxdo_enabled(),
+            "configured": _linuxdo_configured(),
+        },
+    }
+
+
+@router.get("/api/v1/admin/login/linuxdo")
+async def admin_login_linuxdo(request: Request, return_to: str | None = Query(default=None)):
+    if not _linuxdo_enabled():
+        return _build_linuxdo_login_error_response("oauth_disabled")
+    if not _linuxdo_configured():
+        return _build_linuxdo_login_error_response("oauth_not_configured")
+
+    state = _encode_linuxdo_state(_normalize_login_return_to(return_to))
+    params = {
+        "client_id": str(get_config("app.linuxdo_client_id", "") or "").strip(),
+        "redirect_uri": _build_linuxdo_redirect_uri(request),
+        "response_type": "code",
+        "scope": str(get_config("app.linuxdo_scope", "") or "").strip() or LINUXDO_OAUTH_SCOPE,
+        "state": state,
+    }
+    authorize_url = str(get_config("app.linuxdo_authorize_url", "") or "").strip() or LINUXDO_OAUTH_AUTHORIZE_URL
+    response = RedirectResponse(url=f"{authorize_url}?{urlencode(params)}", status_code=302)
+    _set_linuxdo_state_cookie(response, request, state)
+    return response
+
+
+@router.get("/api/v1/admin/login/linuxdo/callback", name="admin_login_linuxdo_callback")
+async def admin_login_linuxdo_callback(
+    request: Request,
+    code: str | None = Query(default=None),
+    state: str | None = Query(default=None),
+    error: str | None = Query(default=None),
+):
+    if error:
+        return _build_linuxdo_login_error_response(str(error or "oauth_error").strip() or "oauth_error")
+    if not code:
+        return _build_linuxdo_login_error_response("missing_code")
+    if not state:
+        return _build_linuxdo_login_error_response("state_missing")
+
+    cookie_state = str(request.cookies.get(LINUXDO_STATE_COOKIE, "") or "").strip()
+    if not cookie_state:
+        return _build_linuxdo_login_error_response("state_missing")
+    if cookie_state != state:
+        return _build_linuxdo_login_error_response("state_mismatch")
+
+    decoded = _decode_linuxdo_state(state)
+    if not decoded:
+        return _build_linuxdo_login_error_response("state_mismatch")
+
     try:
-        session_ttl_hours = int(get_config("app.admin_session_ttl_hours", 8) or 8)
-    except Exception:
-        session_ttl_hours = 8
-    session_ttl_hours = max(1, min(72, session_ttl_hours))
-    session_token = create_admin_session_token(admin_username, ttl_hours=session_ttl_hours)
-    response = JSONResponse({"status": "success", "password_reset_required": weak_admin_password and placeholder_bootstrap})
-    _set_admin_session_cookie(response, request, session_token, session_ttl_hours)
+        user_info = await _fetch_linuxdo_userinfo(code, _build_linuxdo_redirect_uri(request))
+    except HTTPException as exc:
+        code_map = {
+            403: "allowlist_denied",
+            502: "token_exchange_failed",
+            503: "oauth_not_configured",
+        }
+        error_code = code_map.get(exc.status_code, "userinfo_failed")
+        return _build_linuxdo_login_error_response(error_code, str(exc.detail or "").strip() or None)
+
+    allowed_sub = {
+        item.strip()
+        for item in str(get_config("app.linuxdo_allowed_sub", "") or "").split(",")
+        if item.strip()
+    }
+    allowed_usernames = {
+        item.strip().lower()
+        for item in str(get_config("app.linuxdo_allowed_username", "") or "").split(",")
+        if item.strip()
+    }
+    subject = str(user_info.get("sub") or user_info.get("id") or "").strip()
+    username = str(user_info.get("preferred_username") or user_info.get("username") or "").strip()
+    if allowed_sub and subject not in allowed_sub:
+        return _build_linuxdo_login_error_response("allowlist_denied")
+    if allowed_usernames and username.lower() not in allowed_usernames:
+        return _build_linuxdo_login_error_response("allowlist_denied")
+
+    admin_username = str(get_config("app.admin_username", "admin") or "admin").strip() or "admin"
+    response = _issue_admin_session_response(
+        request,
+        admin_username=admin_username,
+        redirect_to=decoded.get("return_to") or "/admin/token",
+    )
+    _clear_linuxdo_state_cookie(response)
     return response
 
 
@@ -599,6 +864,13 @@ async def update_config_api(data: dict):
                 app_cfg.pop("api_key", None)
             else:
                 app_cfg["api_key"] = value
+
+        if isinstance(app_cfg.get("linuxdo_client_secret"), str):
+            value = app_cfg.get("linuxdo_client_secret", "").strip()
+            if not value or value == SECRET_PLACEHOLDER:
+                app_cfg.pop("linuxdo_client_secret", None)
+            else:
+                app_cfg["linuxdo_client_secret"] = value
 
         for key in ("cf_clearance", "wreq_emulation_nsfw"):
             if isinstance(grok_cfg.get(key), str):
