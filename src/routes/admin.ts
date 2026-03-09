@@ -492,6 +492,36 @@ function encodeAssetPath(raw: string): string {
   }
 }
 
+function rawCacheItemName(type: CacheType, key: string): string {
+  return key.startsWith(`${type}/`) ? key.slice(type.length + 1) : key;
+}
+
+function decodeCacheItemName(name: string): string {
+  try {
+    return decodeURIComponent(name);
+  } catch {
+    return name;
+  }
+}
+
+function buildCacheItemUrl(name: string): string {
+  if (/^[A-Za-z0-9._-]{1,255}$/.test(name)) {
+    return `/images/${encodeURIComponent(name)}`;
+  }
+  const encoded = encodeAssetPath(name);
+  return `/images/${encodeURIComponent(encoded)}`;
+}
+
+function buildCacheItemUrls(type: CacheType, key: string): { name: string; displayName: string; viewUrl: string; previewUrl: string } {
+  const name = rawCacheItemName(type, key);
+  const displayName = decodeCacheItemName(name);
+  const viewUrl = buildCacheItemUrl(displayName);
+  if (type === "image") {
+    return { name, displayName, viewUrl, previewUrl: viewUrl };
+  }
+  return { name, displayName, viewUrl, previewUrl: "" };
+}
+
 function parseWsMessageData(data: unknown): Record<string, unknown> | null {
   let raw = "";
   if (typeof data === "string") raw = data;
@@ -1746,12 +1776,14 @@ adminRoutes.get("/api/v1/admin/cache/list", requireAdminAuth, async (c) => {
 
     const { total, items } = await listCacheRowsByType(c.env.DB, type, pageSize, offset);
     const mapped = items.map((it) => {
-      const name = it.key.startsWith(`${type}/`) ? it.key.slice(type.length + 1) : it.key;
+      const { name, displayName, viewUrl, previewUrl } = buildCacheItemUrls(type, it.key);
       return {
         name,
+        display_name: displayName,
         size_bytes: it.size,
         mtime_ms: it.last_access_at || it.created_at,
-        preview_url: type === "image" ? `/images/${encodeURIComponent(name)}` : "",
+        view_url: viewUrl,
+        preview_url: previewUrl,
       };
     });
 
@@ -2488,12 +2520,13 @@ adminRoutes.get("/api/cache/list", requireAdminAuth, async (c) => {
 
     const { total, items } = await listCacheRowsByType(c.env.DB, type, limit, offset);
     const mapped = items.map((it) => {
-      const name = it.key.startsWith(`${type}/`) ? it.key.slice(type.length + 1) : it.key;
+      const { name, displayName, viewUrl } = buildCacheItemUrls(type, it.key);
       return {
         name,
+        display_name: displayName,
         size: formatBytes(it.size),
         mtime: it.last_access_at || it.created_at,
-        url: `/images/${name}`,
+        url: viewUrl,
       };
     });
 

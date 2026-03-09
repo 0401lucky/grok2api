@@ -792,6 +792,7 @@ class DownloadService(BaseService):
         if media_type == "image":
             for item in paged:
                 item["view_url"] = f"/v1/files/image/{item['name']}"
+                item["preview_url"] = item["view_url"]
         else:
             preview_map = {}
             if self.image_dir.exists():

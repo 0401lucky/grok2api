@@ -806,7 +806,10 @@ function renderLocalCacheList(type, items) {
   const selected = selectedLocal[type];
   body.innerHTML = items.map(item => {
     const timeText = formatTime(item.mtime_ms);
-    const preview = item.preview_url ? `<img src="${item.preview_url}" alt="" class="cache-preview">` : '';
+    const previewUrl = item.preview_url || '';
+    const viewUrl = item.view_url || previewUrl || '';
+    const displayName = item.display_name || item.name;
+    const preview = previewUrl ? `<img src="${previewUrl}" alt="" class="cache-preview">` : '';
     const checked = selected.has(item.name) ? 'checked' : '';
     const rowClass = selected.has(item.name) ? 'row-selected' : '';
     return `
@@ -817,14 +820,14 @@ function renderLocalCacheList(type, items) {
         <td class="text-left">
           <div class="flex items-center gap-2" style="min-width:0">
             ${preview}
-            <span class="font-mono text-xs text-gray-500 cache-filename" title="${item.name}">${item.name}</span>
+            <span class="font-mono text-xs text-gray-500 cache-filename" title="${displayName}">${displayName}</span>
           </div>
         </td>
         <td class="text-left">${formatSize(item.size_bytes)}</td>
         <td class="text-left text-xs text-gray-500">${timeText}</td>
         <td class="text-center">
           <div class="cache-list-actions">
-            <button class="cache-icon-button" onclick="viewLocalFile('${type}', '${item.name}')" title="查看">
+            <button class="cache-icon-button" onclick="viewLocalFile('${viewUrl}', '${type}', '${item.name}')" title="查看">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"></path>
                 <circle cx="12" cy="12" r="3"></circle>
@@ -845,10 +848,15 @@ function renderLocalCacheList(type, items) {
   updateSelectedCount();
 }
 
-function viewLocalFile(type, name) {
+function viewLocalFile(url, type, name) {
+  const target = String(url || '').trim();
+  if (target) {
+    window.open(target, '_blank');
+    return;
+  }
   const safeName = encodeURIComponent(name);
-  const url = `/images/${safeName}`;
-  window.open(url, '_blank');
+  const fallback = type === 'video' ? `/v1/files/video/${safeName}` : `/v1/files/image/${safeName}`;
+  window.open(fallback, '_blank');
 }
 
 async function deleteLocalFile(type, name) {
