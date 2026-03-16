@@ -402,6 +402,71 @@ function detectImageMime(bytes: Uint8Array): string | null {
   return null;
 }
 
+function extractLocalUploadImageName(imageInput: string, requestOrigin: string): string | null {
+  const raw = String(imageInput || "").trim();
+  if (!raw) return null;
+
+  let pathname = "";
+  if (raw.startsWith("/")) {
+    pathname = raw;
+  } else {
+    let parsed: URL;
+    let origin: URL;
+    try {
+      parsed = new URL(raw);
+      origin = new URL(requestOrigin);
+    } catch {
+      return null;
+    }
+    if (parsed.origin !== origin.origin) return null;
+    pathname = parsed.pathname;
+  }
+
+  try {
+    pathname = decodeURIComponent(pathname);
+  } catch {
+    return null;
+  }
+  if (!pathname.startsWith("/")) pathname = `/${pathname}`;
+
+  let name = "";
+  if (pathname.startsWith("/images/")) {
+    name = pathname.slice("/images/".length);
+  } else if (pathname.startsWith("/v1/files/image/")) {
+    name = pathname.slice("/v1/files/image/".length);
+  } else {
+    return null;
+  }
+
+  if (name.includes("/")) return null;
+  return /^upload-[A-Za-z0-9-]{8,}\.(png|jpg|jpeg|webp|gif)$/i.test(name) ? name : null;
+}
+
+async function resolveUploadedImageInput(args: {
+  env: Env;
+  imageInput: string;
+  requestOrigin: string;
+}): Promise<string> {
+  const uploadName = extractLocalUploadImageName(args.imageInput, args.requestOrigin);
+  if (!uploadName) return args.imageInput;
+
+  const cached = await args.env.KV_CACHE.getWithMetadata<{ contentType?: string }>(`image/${uploadName}`, {
+    type: "arrayBuffer",
+  });
+  if (!cached?.value) {
+    throw new Error("上传的参考图不存在或已过期，请重新上传");
+  }
+
+  const detectedMime = detectImageMime(new Uint8Array(cached.value));
+  const contentType = String(cached.metadata?.contentType || detectedMime || "").trim().toLowerCase();
+  if (!contentType.startsWith("image/")) {
+    throw new Error("上传的参考图格式无效");
+  }
+
+  // 避免 Worker 再回源请求自己的 /images/*，触发 Cloudflare 522。
+  return `data:${contentType};base64,${arrayBufferToBase64(cached.value)}`;
+}
+
 async function convertRawUrlsByFormatBestEffort(args: {
   rawUrls: string[];
   responseFormat: ImageResponseFormat;
@@ -1365,8 +1430,13 @@ openAiRoutes.post("/chat/completions", async (c) => {
       const imgInputs = isVideoModel && images.length > 1 ? images.slice(0, 1) : images;
 
       try {
-        const uploads = await mapLimit(imgInputs, 5, (u) =>
-          uploadImage(u, cookie, settingsBundle.grok, {
+        const uploads = await mapLimit(imgInputs, 5, async (u) => {
+          const resolvedInput = await resolveUploadedImageInput({
+            env: c.env,
+            imageInput: u,
+            requestOrigin: origin,
+          });
+          return uploadImage(resolvedInput, cookie, settingsBundle.grok, {
             requestOrigin: origin,
             ...(c.env.IMAGE_FETCH_ALLOW_HOSTS
               ? { allowHostsCsv: c.env.IMAGE_FETCH_ALLOW_HOSTS }
@@ -1376,8 +1446,8 @@ openAiRoutes.post("/chat/completions", async (c) => {
               Math.max(1, parseIntSafe(c.env.IMAGE_FETCH_MAX_BYTES, 10 * 1024 * 1024)),
             ),
             timeoutMs: 10000,
-          }),
-        );
+          });
+        });
         const imgIds = uploads.map((u) => u.fileId).filter(Boolean);
         const imgUris = uploads.map((u) => u.fileUri).filter(Boolean);
 
