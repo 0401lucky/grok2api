@@ -35,6 +35,29 @@ _TAG_RESPONSES = "OpenAI - Responses"
 _TAG_IMAGES = "OpenAI - Images"
 _TAG_VIDEOS = "OpenAI - Videos"
 _TAG_FILES = "OpenAI - Files"
+_CONSOLE_ONLY_MODEL_ALIASES = {
+    "grok-4.3": "grok-4.3-console",
+}
+
+
+def _resolve_public_model(model_name: str) -> tuple[str, ModelSpec | None]:
+    spec = model_registry.get(model_name)
+    if spec is not None and model_visibility.is_public(spec):
+        return model_name, spec
+
+    if model_visibility.console_only_enabled():
+        alias = _CONSOLE_ONLY_MODEL_ALIASES.get(model_name)
+        if alias:
+            alias_spec = model_registry.get(alias)
+            if alias_spec is not None and model_visibility.is_public(alias_spec):
+                logger.info(
+                    "model routed via console alias: requested_model={} effective_model={}",
+                    model_name,
+                    alias,
+                )
+                return alias, alias_spec
+
+    return model_name, spec
 
 
 async def _available_pools(request: Request) -> frozenset[str]:
@@ -146,10 +169,9 @@ _EFFORT_VALUES = {"none", "minimal", "low", "medium", "high", "xhigh"}
 _LITE_IMAGE_MODELS = {"grok-imagine-image-lite"}
 
 
-def _validate_chat(req: ChatCompletionRequest) -> None:
+def _validate_chat(req: ChatCompletionRequest, spec: ModelSpec | None = None) -> None:
     from app.platform.errors import ValidationError
 
-    spec = model_registry.get(req.model)
     if spec is None or not model_visibility.is_public(spec):
         raise ValidationError(
             f"Model {req.model!r} does not exist or you do not have access to it.",
@@ -215,7 +237,8 @@ async def _upload_to_data_uri(upload: UploadFile, *, param: str) -> str:
     "/chat/completions", tags=[_TAG_CHAT], dependencies=[Depends(verify_api_key)]
 )
 async def chat_completions_endpoint(req: ChatCompletionRequest):
-    _validate_chat(req)
+    model_name, spec = _resolve_public_model(req.model)
+    _validate_chat(req, spec)
     from app.platform.config.snapshot import get_config
 
     cfg = get_config()
@@ -223,13 +246,6 @@ async def chat_completions_endpoint(req: ChatCompletionRequest):
         req.stream if req.stream is not None else cfg.get_bool("features.stream", True)
     )
 
-    spec = model_registry.get(req.model)
-    if spec is None or not model_visibility.is_public(spec):
-        raise ValidationError(
-            f"Model {req.model!r} does not exist or you do not have access to it.",
-            param="model",
-            code="model_not_found",
-        )
     messages = [m.model_dump(exclude_none=True) for m in req.messages]
 
     try:
@@ -240,7 +256,7 @@ async def chat_completions_endpoint(req: ChatCompletionRequest):
             cfg = req.image_config or ImageConfig()
             _validate_image_edit_n(cfg.n or 1, param="image_config.n")
             result = await img_edit(
-                model=req.model,
+                model=model_name,
                 messages=messages,
                 n=cfg.n or 1,
                 size=cfg.size or "1024x1024",
@@ -256,7 +272,7 @@ async def chat_completions_endpoint(req: ChatCompletionRequest):
             size = cfg.size or "1024x1024"
             fmt = cfg.response_format or "url"
             n = cfg.n or 1
-            _validate_image_n(req.model, n, param="image_config.n")
+            _validate_image_n(model_name, n, param="image_config.n")
             # Extract prompt from last user message.
             prompt = next(
                 (
@@ -269,7 +285,7 @@ async def chat_completions_endpoint(req: ChatCompletionRequest):
                 "",
             )
             result = await img_gen(
-                model=req.model,
+                model=model_name,
                 prompt=prompt or "",
                 n=n,
                 size=size,
@@ -286,7 +302,7 @@ async def chat_completions_endpoint(req: ChatCompletionRequest):
 
             _validate_video_length(vcfg.seconds or 6)
             result = await vid_comp(
-                model=req.model,
+                model=model_name,
                 messages=messages,
                 stream=is_stream,
                 seconds=vcfg.seconds or 6,
@@ -302,7 +318,7 @@ async def chat_completions_endpoint(req: ChatCompletionRequest):
             else:
                 emit_think = req.reasoning_effort != "none"
             result = await chat_completions(
-                model=req.model,
+                model=model_name,
                 messages=messages,
                 stream=is_stream,
                 emit_think=emit_think,
@@ -319,7 +335,7 @@ async def chat_completions_endpoint(req: ChatCompletionRequest):
     except Exception as exc:
         logger.exception(
             "chat completions endpoint failed: model={} stream={} error={}",
-            req.model,
+            model_name,
             is_stream,
             exc,
         )
@@ -381,7 +397,7 @@ async def responses_endpoint(req: ResponsesCreateRequest):
     from app.platform.config.snapshot import get_config
     from app.platform.errors import ValidationError as _ValidationError
 
-    spec = model_registry.get(req.model)
+    model_name, spec = _resolve_public_model(req.model)
     if spec is None or not model_visibility.is_public(spec):
         raise _ValidationError(
             f"Model {req.model!r} does not exist or you do not have access to it.",
@@ -415,7 +431,7 @@ async def responses_endpoint(req: ResponsesCreateRequest):
     from .responses import create as responses_create
 
     result = await responses_create(
-        model=req.model,
+        model=model_name,
         input_val=req.input,
         instructions=req.instructions,
         stream=is_stream,

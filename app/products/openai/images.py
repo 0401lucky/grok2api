@@ -266,6 +266,11 @@ def _output_content(image: _ImageOutput, *, chat_format: bool) -> str:
 _LITE_IMAGE_MODELS = frozenset({"grok-imagine-image-lite"})
 # WS models that use quality mode (enable_pro=True).
 _PRO_IMAGE_MODELS  = frozenset({"grok-imagine-image-pro"})
+_IMAGE_EXTRA_RETRY_CODES = frozenset({500, 502})
+
+
+def _image_retry_codes() -> frozenset[int]:
+    return frozenset(set(_configured_retry_codes(get_config())) | _IMAGE_EXTRA_RETRY_CODES)
 
 
 async def generate(
@@ -309,156 +314,219 @@ async def generate(
             chat_format     = chat_format,
         )
 
-    acct = await _acct_dir.reserve_any(
-        spec.pool_candidates(),
-        now_s_override=now_s(),
-    )
-    if acct is None:
-        raise RateLimitError("No available accounts for image generation")
-
-    token       = acct.token
     response_id = make_response_id()
     enable_pro  = model in _PRO_IMAGE_MODELS
     _ws_mode_id = int(spec.mode_id)
+    max_retries = selection_max_retries()
+    retry_codes = _image_retry_codes()
 
     if stream:
         async def _sse_stream() -> AsyncGenerator[str, None]:
-            success = False
-            fail_exc: BaseException | None = None
-            progress_map: dict[object, int] = {}
-            completed_ids: set[object] = set()
-            last_progress = -1
-            try:
-                async for ev in stream_images(
-                    token, prompt,
-                    aspect_ratio = aspect_ratio,
-                    n            = n,
-                    enable_nsfw  = enable_nsfw,
-                    enable_pro   = enable_pro,
-                ):
-                    ev_type = ev.get("type")
-                    if ev_type == "error":
-                        raise UpstreamError(f"Image error: {ev.get('error', '')}")
-                    if ev_type == "moderated":
-                        logger.warning("image generation slot moderated: image_id={}", ev.get("image_id", "")[:8])
-                        continue
-                    if ev_type == "progress":
-                        key = ev.get("image_id") or f"progress-{len(progress_map)}"
-                        progress_map[key] = _clamp_progress(ev.get("progress") or 0)
+            excluded: list[str] = []
+            for attempt in range(max_retries + 1):
+                acct = await _acct_dir.reserve_any(
+                    spec.pool_candidates(),
+                    now_s_override=now_s(),
+                    exclude_tokens=excluded or None,
+                )
+                if acct is None:
+                    raise RateLimitError("No available accounts for image generation")
+
+                token = acct.token
+                success = False
+                fail_exc: BaseException | None = None
+                retry = False
+                progress_map: dict[object, int] = {}
+                completed_ids: set[object] = set()
+                last_progress = -1
+                try:
+                    async for ev in stream_images(
+                        token, prompt,
+                        aspect_ratio = aspect_ratio,
+                        n            = n,
+                        enable_nsfw  = enable_nsfw,
+                        enable_pro   = enable_pro,
+                    ):
+                        ev_type = ev.get("type")
+                        if ev_type == "error":
+                            raise UpstreamError(f"Image error: {ev.get('error', '')}")
+                        if ev_type == "moderated":
+                            logger.warning("image generation slot moderated: image_id={}", ev.get("image_id", "")[:8])
+                            continue
+                        if ev_type == "progress":
+                            key = ev.get("image_id") or f"progress-{len(progress_map)}"
+                            progress_map[key] = _clamp_progress(ev.get("progress") or 0)
+                            aggregate = _compute_progress_percent(progress_map, n)
+                            if chat_format and aggregate > last_progress:
+                                last_progress = aggregate
+                                reason = _progress_reason(
+                                    "图片",
+                                    aggregate,
+                                    completed=len(completed_ids),
+                                    total=n,
+                                )
+                                chunk = make_thinking_chunk(response_id, model, reason + "\n")
+                                yield f"data: {orjson.dumps(chunk).decode()}\n\n"
+                            continue
+                        if not ev.get("is_final"):
+                            continue
+                        key = ev.get("image_id") or f"final-{len(completed_ids)}"
+                        progress_map[key] = 100
+                        completed_ids.add(key)
                         aggregate = _compute_progress_percent(progress_map, n)
                         if chat_format and aggregate > last_progress:
                             last_progress = aggregate
-                            reason = _progress_reason(
-                                "图片",
-                                aggregate,
-                                completed=len(completed_ids),
-                                total=n,
-                            )
+                            reason = _progress_reason("图片", aggregate, completed=len(completed_ids), total=n)
                             chunk = make_thinking_chunk(response_id, model, reason + "\n")
                             yield f"data: {orjson.dumps(chunk).decode()}\n\n"
-                        continue
-                    if not ev.get("is_final"):
-                        continue
-                    key = ev.get("image_id") or f"final-{len(completed_ids)}"
-                    progress_map[key] = 100
-                    completed_ids.add(key)
-                    aggregate = _compute_progress_percent(progress_map, n)
-                    if chat_format and aggregate > last_progress:
-                        last_progress = aggregate
-                        reason = _progress_reason("图片", aggregate, completed=len(completed_ids), total=n)
-                        chunk = make_thinking_chunk(response_id, model, reason + "\n")
+                        image = await _resolve_image_output(
+                            token=token,
+                            url=ev.get("url", ""),
+                            response_format=response_format,
+                            blob_b64=ev.get("blob") or None,
+                        )
+                        content = _output_content(image, chat_format=chat_format)
+                        chunk = make_stream_chunk(response_id, model, content)
                         yield f"data: {orjson.dumps(chunk).decode()}\n\n"
-                    image = await _resolve_image_output(
-                        token=token,
-                        url=ev.get("url", ""),
-                        response_format=response_format,
-                        blob_b64=ev.get("blob") or None,
-                    )
-                    content = _output_content(image, chat_format=chat_format)
-                    chunk = make_stream_chunk(response_id, model, content)
-                    yield f"data: {orjson.dumps(chunk).decode()}\n\n"
 
-                final = make_stream_chunk(response_id, model, "", is_final=True)
-                yield f"data: {orjson.dumps(final).decode()}\n\n"
-                yield "data: [DONE]\n\n"
-                success = True
-            except BaseException as exc:
-                fail_exc = exc
-                raise
-            finally:
-                await _acct_dir.release(acct)
-                # WS image gen has its own upstream rate limiting — skip quota tracking.
-                # Still propagate auth failures so bad accounts get marked expired.
-                if not success and fail_exc is not None:
-                    kind = _feedback_kind(fail_exc)
-                    if kind in (FeedbackKind.UNAUTHORIZED, FeedbackKind.FORBIDDEN):
-                        await _acct_dir.feedback(token, kind, _ws_mode_id)
+                    final = make_stream_chunk(response_id, model, "", is_final=True)
+                    yield f"data: {orjson.dumps(final).decode()}\n\n"
+                    yield "data: [DONE]\n\n"
+                    success = True
+                    return
+                except UpstreamError as exc:
+                    fail_exc = exc
+                    if _should_retry_upstream(exc, retry_codes) and attempt < max_retries:
+                        retry = True
+                        logger.warning(
+                            "image stream retry scheduled: attempt={}/{} status={} token={}...",
+                            attempt + 1,
+                            max_retries,
+                            exc.status,
+                            token[:8],
+                        )
+                    else:
+                        raise
+                except BaseException as exc:
+                    fail_exc = exc
+                    raise
+                finally:
+                    await _acct_dir.release(acct)
+                    # WS image gen has its own upstream rate limiting — skip quota tracking.
+                    # Still propagate auth failures so bad accounts get marked expired.
+                    if not success and fail_exc is not None:
+                        kind = _feedback_kind(fail_exc)
+                        if kind in (FeedbackKind.UNAUTHORIZED, FeedbackKind.FORBIDDEN):
+                            await _acct_dir.feedback(token, kind, _ws_mode_id)
+
+                if retry:
+                    excluded.append(token)
+                    continue
+
+            raise RateLimitError("No available accounts for image generation")
 
         return _sse_stream()
 
     # Non-streaming: collect all final images.
     finals: list[_ImageOutput] = []
     reasoning_updates: list[str] = []
-    progress_map: dict[object, int] = {}
-    completed_ids: set[object] = set()
-    success = False
-    fail_exc: BaseException | None = None
-    try:
-        async for ev in stream_images(
-            token, prompt,
-            aspect_ratio = aspect_ratio,
-            n            = n,
-            enable_nsfw  = enable_nsfw,
-            enable_pro   = enable_pro,
-        ):
-            ev_type = ev.get("type")
-            if ev_type == "error":
-                raise UpstreamError(f"Image generation failed: {ev.get('error', 'unknown')}")
-            if ev_type == "moderated":
-                logger.warning("image generation slot moderated: image_id={}", ev.get("image_id", "")[:8])
-                continue
-            if ev_type == "progress":
-                key = ev.get("image_id") or f"progress-{len(progress_map)}"
-                progress_map[key] = _clamp_progress(ev.get("progress") or 0)
-                if chat_format:
-                    _append_reason_update(
-                        reasoning_updates,
-                        "图片",
-                        _compute_progress_percent(progress_map, n),
-                        completed=len(completed_ids),
-                        total=n,
+    excluded: list[str] = []
+    for attempt in range(max_retries + 1):
+        acct = await _acct_dir.reserve_any(
+            spec.pool_candidates(),
+            now_s_override=now_s(),
+            exclude_tokens=excluded or None,
+        )
+        if acct is None:
+            raise RateLimitError("No available accounts for image generation")
+
+        token = acct.token
+        attempt_finals: list[_ImageOutput] = []
+        attempt_reasoning_updates: list[str] = []
+        progress_map: dict[object, int] = {}
+        completed_ids: set[object] = set()
+        success = False
+        fail_exc: BaseException | None = None
+        retry = False
+        try:
+            async for ev in stream_images(
+                token, prompt,
+                aspect_ratio = aspect_ratio,
+                n            = n,
+                enable_nsfw  = enable_nsfw,
+                enable_pro   = enable_pro,
+            ):
+                ev_type = ev.get("type")
+                if ev_type == "error":
+                    raise UpstreamError(f"Image generation failed: {ev.get('error', 'unknown')}")
+                if ev_type == "moderated":
+                    logger.warning("image generation slot moderated: image_id={}", ev.get("image_id", "")[:8])
+                    continue
+                if ev_type == "progress":
+                    key = ev.get("image_id") or f"progress-{len(progress_map)}"
+                    progress_map[key] = _clamp_progress(ev.get("progress") or 0)
+                    if chat_format:
+                        _append_reason_update(
+                            attempt_reasoning_updates,
+                            "图片",
+                            _compute_progress_percent(progress_map, n),
+                            completed=len(completed_ids),
+                            total=n,
+                        )
+                    continue
+                if ev.get("is_final"):
+                    key = ev.get("image_id") or f"final-{len(completed_ids)}"
+                    progress_map[key] = 100
+                    completed_ids.add(key)
+                    if chat_format:
+                        _append_reason_update(
+                            attempt_reasoning_updates,
+                            "图片",
+                            _compute_progress_percent(progress_map, n),
+                            completed=len(completed_ids),
+                            total=n,
+                        )
+                    image = await _resolve_image_output(
+                        token=token,
+                        url=ev.get("url", ""),
+                        response_format=response_format,
+                        blob_b64=ev.get("blob") or None,
                     )
-                continue
-            if ev.get("is_final"):
-                key = ev.get("image_id") or f"final-{len(completed_ids)}"
-                progress_map[key] = 100
-                completed_ids.add(key)
-                if chat_format:
-                    _append_reason_update(
-                        reasoning_updates,
-                        "图片",
-                        _compute_progress_percent(progress_map, n),
-                        completed=len(completed_ids),
-                        total=n,
-                    )
-                image = await _resolve_image_output(
-                    token=token,
-                    url=ev.get("url", ""),
-                    response_format=response_format,
-                    blob_b64=ev.get("blob") or None,
+                    attempt_finals.append(image)
+            success = True
+            finals = attempt_finals
+            reasoning_updates = attempt_reasoning_updates
+            break
+        except UpstreamError as exc:
+            fail_exc = exc
+            if _should_retry_upstream(exc, retry_codes) and attempt < max_retries:
+                retry = True
+                logger.warning(
+                    "image retry scheduled: attempt={}/{} status={} token={}...",
+                    attempt + 1,
+                    max_retries,
+                    exc.status,
+                    token[:8],
                 )
-                finals.append(image)
-        success = True
-    except BaseException as exc:
-        fail_exc = exc
-        raise
-    finally:
-        await _acct_dir.release(acct)
-        # WS image gen has its own upstream rate limiting — skip quota tracking.
-        if not success and fail_exc is not None:
-            kind = _feedback_kind(fail_exc)
-            if kind in (FeedbackKind.UNAUTHORIZED, FeedbackKind.FORBIDDEN):
-                await _acct_dir.feedback(token, kind, _ws_mode_id)
+            else:
+                raise
+        except BaseException as exc:
+            fail_exc = exc
+            raise
+        finally:
+            await _acct_dir.release(acct)
+            # WS image gen has its own upstream rate limiting — skip quota tracking.
+            if not success and fail_exc is not None:
+                kind = _feedback_kind(fail_exc)
+                if kind in (FeedbackKind.UNAUTHORIZED, FeedbackKind.FORBIDDEN):
+                    await _acct_dir.feedback(token, kind, _ws_mode_id)
+
+        if retry:
+            excluded.append(token)
+            continue
+
+    if not finals:
+        raise UpstreamError("Image generation returned no images")
 
     if chat_format:
         content = "\n\n".join(image.markdown_value for image in finals)
@@ -982,7 +1050,7 @@ async def _run_lite_request(
     _acct_dir = await get_runtime_directory()
 
     max_retries = selection_max_retries()
-    retry_codes = _configured_retry_codes(get_config())
+    retry_codes = _image_retry_codes()
     excluded: list[str] = []
 
     for attempt in range(max_retries + 1):
