@@ -199,7 +199,6 @@ async def add_tokens(
     refresh_svc: "AccountRefreshService" = Depends(get_refresh_svc),
 ):
     requested_pool = (req.pool or "basic").strip().lower()
-    sync_auto_detect = requested_pool == "auto"
 
     # Deduplicate and sanitize input
     cleaned: list[str] = []
@@ -229,23 +228,13 @@ async def add_tokens(
         len(existing),
     )
 
-    if sync_auto_detect:
-        try:
-            refresh_result = await refresh_svc.refresh_on_import(new_tokens)
-            logger.info(
-                "admin auto-detect quota sync completed: token_count={} refreshed={} failed={}",
-                len(new_tokens), refresh_result.refreshed, refresh_result.failed,
-            )
-        except Exception as exc:
-            logger.warning("admin auto-detect quota sync failed: token_count={} error={}", len(new_tokens), exc)
-    else:
-        asyncio.create_task(_refresh_imported(refresh_svc, new_tokens))
+    asyncio.create_task(_refresh_imported(refresh_svc, new_tokens))
 
     return _json({
         "status": "success",
         "count": result.upserted or len(new_tokens),
         "skipped": len(existing),
-        "synced": sync_auto_detect,
+        "synced": False,
     })
 
 
