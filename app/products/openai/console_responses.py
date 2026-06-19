@@ -11,6 +11,7 @@ from app.dataplane.account.selector import current_strategy
 from app.dataplane.reverse.protocol.xai_console_chat import (
     ConsoleStreamAdapter,
     build_console_payload,
+    client_function_tool_names,
     raise_empty_console_response,
     stream_console_chat,
 )
@@ -18,7 +19,7 @@ from app.platform.config.snapshot import get_config
 from app.platform.errors import RateLimitError, UpstreamError
 from app.platform.logging.logger import logger
 from app.platform.runtime.clock import now_s
-from app.platform.tokens import estimate_prompt_tokens, estimate_tokens
+from app.platform.tokens import estimate_prompt_tokens, estimate_tokens, estimate_tool_call_tokens
 from app.products._account_selection import reserve_account, selection_max_retries
 from app.products.openai.chat import _configured_retry_codes, _should_retry_upstream
 
@@ -111,6 +112,89 @@ def _message_item(message_id: str, full_text: str) -> dict:
     }
 
 
+def _message_added_event(message_id: str) -> str:
+    return format_sse("response.output_item.added", {
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+            "id": message_id,
+            "type": "message",
+            "role": "assistant",
+            "status": "in_progress",
+            "content": [],
+        },
+    })
+
+
+def _content_part_added_event(message_id: str) -> str:
+    return format_sse("response.content_part.added", {
+        "type": "response.content_part.added",
+        "item_id": message_id,
+        "output_index": 0,
+        "content_index": 0,
+        "part": {"type": "output_text", "text": "", "annotations": []},
+    })
+
+
+def _function_call_events(items: list[dict]) -> list[str]:
+    """把已完成的 function_call items 还原成标准 Responses SSE 事件序列。"""
+    events: list[str] = []
+    for output_index, item in enumerate(items):
+        item_id = item["id"]
+        arguments = item.get("arguments") or "{}"
+        events.append(format_sse("response.output_item.added", {
+            "type": "response.output_item.added",
+            "output_index": output_index,
+            "item": {
+                "id": item_id,
+                "type": "function_call",
+                "call_id": item["call_id"],
+                "name": item["name"],
+                "arguments": "",
+                "status": "in_progress",
+            },
+        }))
+        events.append(format_sse("response.function_call_arguments.delta", {
+            "type": "response.function_call_arguments.delta",
+            "item_id": item_id,
+            "output_index": output_index,
+            "delta": arguments,
+        }))
+        events.append(format_sse("response.function_call_arguments.done", {
+            "type": "response.function_call_arguments.done",
+            "item_id": item_id,
+            "output_index": output_index,
+            "arguments": arguments,
+        }))
+        done_item = dict(item)
+        done_item["status"] = "completed"
+        events.append(format_sse("response.output_item.done", {
+            "type": "response.output_item.done",
+            "output_index": output_index,
+            "item": done_item,
+        }))
+    return events
+
+
+def _tool_response_usage(
+    usage_data: dict[str, Any] | None,
+    *,
+    messages: list[dict],
+    tool_calls: list,
+) -> dict:
+    input_tokens = _usage_int(
+        usage_data,
+        ("input_tokens", "prompt_tokens"),
+        estimate_prompt_tokens(messages),
+    )
+    output_tokens = _usage_int(
+        usage_data,
+        ("output_tokens", "completion_tokens"),
+        estimate_tool_call_tokens(tool_calls),
+    )
+    return build_resp_usage(input_tokens, output_tokens)
+
+
 async def create(
     *,
     model: str,
@@ -135,6 +219,7 @@ async def create(
     timeout_s = cfg.get_float("chat.timeout", 120.0)
     max_retries = selection_max_retries()
     retry_codes = _configured_retry_codes(cfg)
+    function_tool_names = client_function_tool_names(tools)
 
     if tools:
         logger.info(
@@ -166,7 +251,7 @@ async def create(
                 success = False
                 retry = False
                 fail_exc: BaseException | None = None
-                adapter = ConsoleStreamAdapter()
+                adapter = ConsoleStreamAdapter(function_tool_names=function_tool_names)
 
                 try:
                     payload = build_console_payload(
@@ -201,44 +286,88 @@ async def create(
                                 ),
                             },
                         )
-                        yield format_sse(
-                            "response.output_item.added",
-                            {
-                                "type": "response.output_item.added",
-                                "output_index": 0,
-                                "item": {
-                                    "id": message_id,
-                                    "type": "message",
-                                    "role": "assistant",
-                                    "status": "in_progress",
-                                    "content": [],
-                                },
-                            },
-                        )
-                        yield format_sse(
-                            "response.content_part.added",
-                            {
-                                "type": "response.content_part.added",
-                                "item_id": message_id,
-                                "output_index": 0,
-                                "content_index": 0,
-                                "part": {
-                                    "type": "output_text",
-                                    "text": "",
-                                    "annotations": [],
-                                },
-                            },
-                        )
+                        # 启用客户端 function 工具时延迟 message 事件：若出现 function_call，
+                        # Responses 输出必须保持“纯 function_call”，不能夹带 message。
+                        client_function_tools_active = bool(function_tool_names)
+                        message_started = False
+                        if not client_function_tools_active:
+                            yield _message_added_event(message_id)
+                            yield _content_part_added_event(message_id)
+                            message_started = True
 
                         # See chat.py: leading SSE comment heartbeat keeps the
                         # connection alive during the upstream "thinking" phase.
+                        text_buf: list[str] = []
                         yield SSE_HEARTBEAT
                         async for event_type, data in stream_console_chat(
                             token,
                             payload,
                             timeout_s=timeout_s,
                         ):
+                            emitted_frame = False
                             for token_text in adapter.feed(event_type, data):
+                                text_buf.append(token_text)
+                                if client_function_tools_active:
+                                    continue
+                                yield format_sse(
+                                    "response.output_text.delta",
+                                    {
+                                        "type": "response.output_text.delta",
+                                        "item_id": message_id,
+                                        "output_index": 0,
+                                        "content_index": 0,
+                                        "delta": token_text,
+                                    },
+                                )
+                                emitted_frame = True
+                            # 缓冲文本期间不外发增量，补心跳避免客户端在等待 function_call 时超时
+                            if client_function_tools_active and not emitted_frame:
+                                yield SSE_HEARTBEAT
+
+                        function_items = (
+                            adapter.function_call_items if client_function_tools_active else []
+                        )
+                        if function_items:
+                            for event in _function_call_events(function_items):
+                                yield event
+                            yield format_sse(
+                                "response.completed",
+                                {
+                                    "type": "response.completed",
+                                    "response": make_resp_object(
+                                        response_id,
+                                        model,
+                                        "completed",
+                                        function_items,
+                                        _tool_response_usage(
+                                            adapter.usage,
+                                            messages=messages,
+                                            tool_calls=adapter.parsed_tool_calls,
+                                        ),
+                                    ),
+                                },
+                            )
+                            yield "data: [DONE]\n\n"
+                            success = True
+                            logger.info(
+                                "console responses stream function_call: attempt={}/{} model={} calls={}",
+                                attempt + 1,
+                                max_retries + 1,
+                                model,
+                                len(function_items),
+                            )
+                            return
+
+                        full_text = "".join(text_buf)
+                        if not full_text.strip():
+                            raise_empty_console_response(model)
+
+                        # 延迟场景（有 function 工具但模型未调用）：补发 message 事件与缓冲增量。
+                        if not message_started:
+                            yield _message_added_event(message_id)
+                            yield _content_part_added_event(message_id)
+                            message_started = True
+                            for token_text in text_buf:
                                 yield format_sse(
                                     "response.output_text.delta",
                                     {
@@ -250,9 +379,6 @@ async def create(
                                     },
                                 )
 
-                        full_text = adapter.full_text
-                        if not full_text.strip():
-                            raise_empty_console_response(model)
                         msg_item = _message_item(message_id, full_text)
                         yield format_sse(
                             "response.output_text.done",
@@ -358,7 +484,7 @@ async def create(
         token = acct.token
         success = False
         fail_exc: BaseException | None = None
-        adapter = ConsoleStreamAdapter()
+        adapter = ConsoleStreamAdapter(function_tool_names=function_tool_names)
 
         try:
             payload = build_console_payload(
@@ -381,6 +507,29 @@ async def create(
                     timeout_s=timeout_s,
                 ):
                     adapter.feed(event_type, data)
+
+                function_items = adapter.function_call_items if function_tool_names else []
+                if function_items:
+                    result = make_resp_object(
+                        response_id,
+                        model,
+                        "completed",
+                        function_items,
+                        _tool_response_usage(
+                            adapter.usage,
+                            messages=messages,
+                            tool_calls=adapter.parsed_tool_calls,
+                        ),
+                    )
+                    success = True
+                    logger.info(
+                        "console responses function_call: attempt={}/{} model={} calls={}",
+                        attempt + 1,
+                        max_retries + 1,
+                        model,
+                        len(function_items),
+                    )
+                    return result
 
                 if not adapter.full_text.strip():
                     raise_empty_console_response(model)

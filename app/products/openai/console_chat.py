@@ -13,6 +13,7 @@ from app.dataplane.account.selector import current_strategy
 from app.dataplane.reverse.protocol.xai_console_chat import (
     ConsoleStreamAdapter,
     build_console_payload,
+    client_function_tool_names,
     raise_empty_console_response,
     stream_console_chat,
 )
@@ -20,11 +21,20 @@ from app.platform.config.snapshot import get_config
 from app.platform.errors import RateLimitError, UpstreamError
 from app.platform.logging.logger import logger
 from app.platform.runtime.clock import now_s
-from app.platform.tokens import estimate_prompt_tokens, estimate_tokens
+from app.platform.tokens import estimate_prompt_tokens, estimate_tokens, estimate_tool_call_tokens
 from app.products._account_selection import reserve_account, selection_max_retries
 from app.products.openai.chat import _configured_retry_codes, _should_retry_upstream
 
-from ._format import build_usage, make_chat_response, make_response_id, make_stream_chunk, SSE_HEARTBEAT
+from ._format import (
+    build_usage,
+    make_chat_response,
+    make_response_id,
+    make_stream_chunk,
+    make_tool_call_chunk,
+    make_tool_call_done_chunk,
+    make_tool_call_response,
+    SSE_HEARTBEAT,
+)
 
 
 def _log_task_exception(task: "asyncio.Task") -> None:
@@ -104,6 +114,25 @@ def _build_chat_usage(
     return build_usage(prompt_tokens, completion_tokens)
 
 
+def _build_tool_call_usage(
+    usage_data: dict[str, Any] | None,
+    *,
+    messages: list[dict],
+    tool_calls: list,
+) -> dict:
+    prompt_tokens = _usage_int(
+        usage_data,
+        ("input_tokens", "prompt_tokens"),
+        estimate_prompt_tokens(messages),
+    )
+    completion_tokens = _usage_int(
+        usage_data,
+        ("output_tokens", "completion_tokens"),
+        estimate_tool_call_tokens(tool_calls),
+    )
+    return build_usage(prompt_tokens, completion_tokens)
+
+
 async def completions(
     *,
     model: str,
@@ -125,6 +154,7 @@ async def completions(
     max_retries = selection_max_retries()
     retry_codes = _configured_retry_codes(cfg)
     response_id = make_response_id()
+    function_tool_names = client_function_tool_names(tools)
 
     if tools:
         logger.info(
@@ -163,7 +193,7 @@ async def completions(
                 success = False
                 retry = False
                 fail_exc: BaseException | None = None
-                adapter = ConsoleStreamAdapter()
+                adapter = ConsoleStreamAdapter(function_tool_names=function_tool_names)
 
                 try:
                     payload = build_console_payload(
@@ -179,6 +209,9 @@ async def completions(
                     )
 
                     try:
+                        # 启用客户端 function 工具时先缓冲文本：若随后出现 function_call，
+                        # 已发出的文本会与 tool_calls 混在同一响应里，故先压住延后处理。
+                        buffered_text: list[str] = []
                         # See chat.py: leading SSE comment heartbeat keeps the
                         # connection alive during the upstream "thinking" phase.
                         yield SSE_HEARTBEAT
@@ -187,16 +220,66 @@ async def completions(
                             payload,
                             timeout_s=timeout_s,
                         ):
+                            emitted_frame = False
                             for token_text in adapter.feed(event_type, data):
+                                if function_tool_names:
+                                    buffered_text.append(token_text)
+                                    continue
                                 chunk = make_stream_chunk(
                                     response_id,
                                     model,
                                     token_text,
                                 )
                                 yield f"data: {orjson.dumps(chunk).decode()}\n\n"
+                                emitted_frame = True
+                            # 缓冲文本期间不外发文本帧，补心跳避免客户端在等待 tool_call 时超时
+                            if function_tool_names and not emitted_frame:
+                                yield SSE_HEARTBEAT
+
+                        tool_calls = adapter.parsed_tool_calls if function_tool_names else []
+                        if tool_calls:
+                            for i, tc in enumerate(tool_calls):
+                                chunk = make_tool_call_chunk(
+                                    response_id,
+                                    model,
+                                    i,
+                                    tc.call_id,
+                                    tc.name,
+                                    tc.arguments,
+                                    is_first=True,
+                                )
+                                yield f"data: {orjson.dumps(chunk).decode()}\n\n"
+                            final = make_tool_call_done_chunk(
+                                response_id,
+                                model,
+                                usage=_build_tool_call_usage(
+                                    adapter.usage,
+                                    messages=messages,
+                                    tool_calls=tool_calls,
+                                ),
+                            )
+                            yield f"data: {orjson.dumps(final).decode()}\n\n"
+                            yield "data: [DONE]\n\n"
+                            success = True
+                            logger.info(
+                                "console chat stream tool_calls: attempt={}/{} model={} calls={}",
+                                attempt + 1,
+                                max_retries + 1,
+                                model,
+                                len(tool_calls),
+                            )
+                            return
 
                         if not adapter.full_text.strip():
                             raise_empty_console_response(model)
+
+                        for token_text in buffered_text:
+                            chunk = make_stream_chunk(
+                                response_id,
+                                model,
+                                token_text,
+                            )
+                            yield f"data: {orjson.dumps(chunk).decode()}\n\n"
 
                         final = make_stream_chunk(
                             response_id,
@@ -268,7 +351,7 @@ async def completions(
         token = acct.token
         success = False
         fail_exc: BaseException | None = None
-        adapter = ConsoleStreamAdapter()
+        adapter = ConsoleStreamAdapter(function_tool_names=function_tool_names)
 
         try:
             payload = build_console_payload(
@@ -290,6 +373,29 @@ async def completions(
                     timeout_s=timeout_s,
                 ):
                     adapter.feed(event_type, data)
+
+                tool_calls = adapter.parsed_tool_calls if function_tool_names else []
+                if tool_calls:
+                    result = make_tool_call_response(
+                        model,
+                        tool_calls,
+                        prompt_content=messages,
+                        response_id=response_id,
+                        usage=_build_tool_call_usage(
+                            adapter.usage,
+                            messages=messages,
+                            tool_calls=tool_calls,
+                        ),
+                    )
+                    success = True
+                    logger.info(
+                        "console chat tool_calls: attempt={}/{} model={} calls={}",
+                        attempt + 1,
+                        max_retries + 1,
+                        model,
+                        len(tool_calls),
+                    )
+                    return result
 
                 if not adapter.full_text.strip():
                     raise_empty_console_response(model)
