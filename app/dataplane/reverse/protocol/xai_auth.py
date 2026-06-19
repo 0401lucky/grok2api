@@ -246,7 +246,17 @@ async def nsfw_sequence(token: str) -> None:
     kwargs = build_session_kwargs(lease=lease)
     try:
         async with ResettableSession(**kwargs) as session:
-            await set_birth_date(token, session=session, lease=lease)
+            try:
+                await set_birth_date(token, session=session, lease=lease)
+            except UpstreamError as exc:
+                # 429 且响应体含 "birth-date-change-limit-reached"，说明生日已设置并被
+                # 锁定，可安全跳过并继续 enable_nsfw。其它 429（真实限流）或其它状态码
+                # 仍作为真实失败重新抛出。
+                body = exc.details.get("body", "")
+                if exc.status == 429 and "birth-date-change-limit-reached" in body:
+                    logger.debug("auth birth date already set (locked), skipping: token={}...", token[:8])
+                else:
+                    raise
             await _grpc_call(
                 NSFW_MGMT_URL, token, build_nsfw_mgmt_payload(),
                 label="enable_nsfw", origin=GROK_ORIGIN, referer=f"{GROK_ORIGIN}/?_s=data",
