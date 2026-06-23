@@ -169,52 +169,74 @@ class LocalAccountRepository:
         revision: int,
     ) -> int:
         ts = now_ms()
-        count = 0
+        quota_cache: dict[str, dict[str, str]] = {}
+
+        def _quota_json(pool: str) -> dict[str, str]:
+            cached = quota_cache.get(pool)
+            if cached is not None:
+                return cached
+            qs = default_quota_set(pool)
+            payload = {
+                "qa": json.dumps(qs.auto.to_dict()),
+                "qf": json.dumps(qs.fast.to_dict()),
+                "qe": json.dumps(qs.expert.to_dict()),
+                "qh": json.dumps(qs.heavy.to_dict())    if qs.heavy    else "{}",
+                "qg": json.dumps(qs.grok_4_3.to_dict()) if qs.grok_4_3 else "{}",
+                "qc": json.dumps(qs.console.to_dict())  if qs.console  else "{}",
+            }
+            quota_cache[pool] = payload
+            return payload
+
+        rows: list[dict[str, Any]] = []
         for item in items:
             try:
                 token = AccountRecord.model_validate({"token": item.token, "pool": item.pool}).token
             except ValueError:
                 continue
             pool = item.pool if item.pool in ("basic", "super", "heavy") else "basic"
-            qs   = default_quota_set(pool)
-            conn.execute(
-                f"""
-                INSERT INTO {_TBL} (
-                    token, pool, status, created_at, updated_at,
-                    tags, quota_auto, quota_fast, quota_expert, quota_heavy, quota_grok_4_3, quota_console,
-                    usage_use_count, usage_fail_count, usage_sync_count,
-                    ext, revision
-                ) VALUES (
-                    :token, :pool, 'active', :ts, :ts,
-                    :tags, :qa, :qf, :qe, :qh, :qg, :qc,
-                    0, 0, 0, :ext, :rev
-                )
-                ON CONFLICT(token) DO UPDATE SET
-                    pool       = excluded.pool,
-                    status     = 'active',
-                    deleted_at = NULL,
-                    updated_at = excluded.updated_at,
-                    tags       = excluded.tags,
-                    ext        = excluded.ext,
-                    revision   = excluded.revision
-                """,
-                {
-                    "token": token,
-                    "pool":  pool,
-                    "ts":    ts,
-                    "tags":  json.dumps(item.tags),
-                    "qa":    json.dumps(qs.auto.to_dict()),
-                    "qf":    json.dumps(qs.fast.to_dict()),
-                    "qe":    json.dumps(qs.expert.to_dict()),
-                    "qh":    json.dumps(qs.heavy.to_dict())    if qs.heavy    else "{}",
-                    "qg":    json.dumps(qs.grok_4_3.to_dict()) if qs.grok_4_3 else "{}",
-                    "qc":    json.dumps(qs.console.to_dict())  if qs.console  else "{}",
-                    "ext":   json.dumps(item.ext),
-                    "rev":   revision,
-                },
+            q = _quota_json(pool)
+            rows.append({
+                "token": token,
+                "pool":  pool,
+                "ts":    ts,
+                "tags":  json.dumps(item.tags),
+                "qa":    q["qa"],
+                "qf":    q["qf"],
+                "qe":    q["qe"],
+                "qh":    q["qh"],
+                "qg":    q["qg"],
+                "qc":    q["qc"],
+                "ext":   json.dumps(item.ext),
+                "rev":   revision,
+            })
+
+        if not rows:
+            return 0
+
+        conn.executemany(
+            f"""
+            INSERT INTO {_TBL} (
+                token, pool, status, created_at, updated_at,
+                tags, quota_auto, quota_fast, quota_expert, quota_heavy, quota_grok_4_3, quota_console,
+                usage_use_count, usage_fail_count, usage_sync_count,
+                ext, revision
+            ) VALUES (
+                :token, :pool, 'active', :ts, :ts,
+                :tags, :qa, :qf, :qe, :qh, :qg, :qc,
+                0, 0, 0, :ext, :rev
             )
-            count += conn.execute("SELECT changes()").fetchone()[0]
-        return count
+            ON CONFLICT(token) DO UPDATE SET
+                pool       = excluded.pool,
+                status     = 'active',
+                deleted_at = NULL,
+                updated_at = excluded.updated_at,
+                tags       = excluded.tags,
+                ext        = excluded.ext,
+                revision   = excluded.revision
+            """,
+            rows,
+        )
+        return len(rows)
 
     def _patch_sync(
         self,
@@ -291,7 +313,8 @@ class LocalAccountRepository:
             if patch.clear_failures:
                 for k in ("cooldown_until", "cooldown_reason", "disabled_at",
                           "disabled_reason", "expired_at", "expired_reason",
-                          "forbidden_strikes"):
+                          "forbidden_strikes", "console_429_count",
+                          "console_429_last_at"):
                     ext.pop(k, None)
                 sets["status"]           = AccountStatus.ACTIVE.value
                 sets["usage_fail_count"] = 0
@@ -350,8 +373,11 @@ class LocalAccountRepository:
                 ).fetchall()
                 items: list[AccountRecord] = []
                 deleted: list[str] = []
+                batch_max_rev = 0
                 for row in rows:
                     r = self._row_to_record(row)
+                    if r.revision > batch_max_rev:
+                        batch_max_rev = r.revision
                     if r.is_deleted():
                         deleted.append(r.token)
                     else:
@@ -359,6 +385,7 @@ class LocalAccountRepository:
                 has_more = len(rows) == limit
                 return AccountChangeSet(
                     revision=rev,
+                    batch_max_revision=batch_max_rev,
                     items=items,
                     deleted_tokens=deleted,
                     has_more=has_more,

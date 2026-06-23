@@ -167,18 +167,24 @@ class RedisAccountRepository:
         limit: int = 5000,
     ) -> AccountChangeSet:
         rev = await self.get_revision()
-        # Tokens whose revision > since_revision.
+        # Tokens whose revision > since_revision; scores carry each row revision.
         entries = await self._r.zrangebyscore(
             _KEY_REV_LOG,
             since_revision + 1,
             "+inf",
-            withscores=False,
+            withscores=True,
             start=0,
             num=limit,
         )
-        tokens = [
-            (e.decode() if isinstance(e, bytes) else e) for e in entries
-        ]
+        tokens: list[str] = []
+        batch_max_rev = 0
+        for entry in entries:
+            token_raw, score = entry
+            token = token_raw.decode() if isinstance(token_raw, bytes) else token_raw
+            score_i = int(score)
+            if score_i > batch_max_rev:
+                batch_max_rev = score_i
+            tokens.append(token)
         items: list[AccountRecord] = []
         deleted: list[str] = []
         for token in tokens:
@@ -193,6 +199,7 @@ class RedisAccountRepository:
                 items.append(record)
         return AccountChangeSet(
             revision=rev,
+            batch_max_revision=batch_max_rev,
             items=items,
             deleted_tokens=deleted,
             has_more=len(entries) == limit,
@@ -306,7 +313,8 @@ class RedisAccountRepository:
             if patch.clear_failures:
                 for k in ("cooldown_until", "cooldown_reason", "disabled_at",
                           "disabled_reason", "expired_at", "expired_reason",
-                          "forbidden_strikes"):
+                          "forbidden_strikes", "console_429_count",
+                          "console_429_last_at"):
                     ext.pop(k, None)
                 updates["status"]           = AccountStatus.ACTIVE.value
                 updates["usage_fail_count"] = "0"

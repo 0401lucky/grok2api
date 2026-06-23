@@ -153,6 +153,18 @@ def normalize_quota_window(
             synced_at=window.synced_at,
             source=window.source,
         )
+    if mode_id == 5:
+        default = default_quota_window(pool, mode_id)
+        if default is None:
+            return None
+        return QuotaWindow(
+            remaining=max(0, min(int(window.remaining), default.total)),
+            total=default.total,
+            window_seconds=default.window_seconds,
+            reset_at=window.reset_at,
+            synced_at=window.synced_at,
+            source=window.source,
+        )
     return window
 
 

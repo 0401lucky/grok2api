@@ -96,6 +96,8 @@ _DISABLED_REASON_KEY = "disabled_reason"
 _EXPIRED_AT_KEY = "expired_at"
 _EXPIRED_REASON_KEY = "expired_reason"
 _FORBIDDEN_STRIKE_KEY = "forbidden_strikes"
+_CONSOLE_429_COUNT_KEY = "console_429_count"
+_CONSOLE_429_LAST_AT_KEY = "console_429_last_at"
 
 
 def derive_status(record: AccountRecord, *, now: int | None = None) -> AccountStatus:
@@ -275,6 +277,8 @@ def apply_feedback(
         ext.pop(_EXPIRED_AT_KEY, None)
         ext.pop(_EXPIRED_REASON_KEY, None)
         ext.pop(_FORBIDDEN_STRIKE_KEY, None)
+        ext.pop(_CONSOLE_429_COUNT_KEY, None)
+        ext.pop(_CONSOLE_429_LAST_AT_KEY, None)
         # Reset quota to defaults.
         qs = default_quota_set(record.pool)
 
@@ -307,6 +311,8 @@ def clear_failures(record: AccountRecord) -> AccountRecord:
         _EXPIRED_AT_KEY,
         _EXPIRED_REASON_KEY,
         _FORBIDDEN_STRIKE_KEY,
+        _CONSOLE_429_COUNT_KEY,
+        _CONSOLE_429_LAST_AT_KEY,
     ):
         ext.pop(k, None)
     return record.model_copy(

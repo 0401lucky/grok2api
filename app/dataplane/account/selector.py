@@ -18,7 +18,6 @@ import random
 from typing import Literal
 
 from app.platform.config.snapshot import get_config
-from ..shared.enums import PoolId
 from .table import AccountRuntimeTable
 
 # Scoring weights used by the quota strategy.
@@ -27,7 +26,9 @@ _W_QUOTA    = 25.0
 _W_RECENT   = 15.0     # penalty for recently used accounts
 _W_INFLIGHT = 20.0
 _W_FAIL     = 4.0
-_RECENT_WINDOW_S = 15  # seconds
+_RECENT_WINDOW_S = 60
+_QUOTA_MAX_INFLIGHT = 12
+_RANDOM_MAX_FAILS = 5
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +137,7 @@ def _quota_select(
     quota_col  = table._quota_col(mode_id)
     total_col  = table._total_col(mode_id)
     window_col = table._window_col(mode_id)
+    inflight_col = table.inflight_by_idx
     _maybe_reset_windows(
         table, candidates, mode_id,
         reset_col, quota_col, total_col, window_col,
@@ -145,7 +147,11 @@ def _quota_select(
     working: set[int] = candidates.copy()
     if exclude_idxs:
         working -= exclude_idxs
-    working = {idx for idx in working if int(quota_col[idx]) > 0}
+    working = {
+        idx for idx in working
+        if int(quota_col[idx]) > 0
+        and int(inflight_col[idx]) < _QUOTA_MAX_INFLIGHT
+    }
     if not working:
         return None
 
@@ -192,10 +198,7 @@ def _maybe_reset_windows(
     pool_id: int,
     now_s: int,
 ) -> None:
-    """Reset expired windows for basic-pool accounts inline (no API call needed)."""
-    if pool_id != int(PoolId.BASIC):
-        return
-
+    """Reset expired windows inline for any pool (no API call needed)."""
     for idx in list(candidates):
         r = reset_col[idx]
         if r == 0 or now_s < r:
@@ -303,6 +306,7 @@ def _random_select(
     max_inflight = int(get_config("account.selection.max_inflight", 8))
     cooling_col  = table.cooling_until_s_by_idx
     inflight_col = table.inflight_by_idx
+    fail_col     = table.fail_count_by_idx
 
     working = candidates.copy()
     if exclude_idxs:
@@ -311,6 +315,7 @@ def _random_select(
         idx for idx in working
         if int(cooling_col[idx]) <= now_s
         and int(inflight_col[idx]) < max_inflight
+        and int(fail_col[idx]) < _RANDOM_MAX_FAILS
     }
     if not working:
         return None

@@ -614,14 +614,18 @@ class SqlAccountRepository:
             )).fetchall()
             items: list[AccountRecord] = []
             deleted: list[str] = []
+            batch_max_rev = 0
             for row in rows:
                 r = _row_to_record(row)
+                if r.revision > batch_max_rev:
+                    batch_max_rev = r.revision
                 if r.is_deleted():
                     deleted.append(r.token)
                 else:
                     items.append(r)
             return AccountChangeSet(
                 revision=rev,
+                batch_max_revision=batch_max_rev,
                 items=items,
                 deleted_tokens=deleted,
                 has_more=len(rows) == limit,
@@ -682,7 +686,9 @@ class SqlAccountRepository:
             count = 0
             for patch in patches:
                 row = (await conn.execute(
-                    sa.select(accounts_table).where(accounts_table.c.token == patch.token)
+                    sa.select(accounts_table)
+                    .where(accounts_table.c.token == patch.token)
+                    .with_for_update()
                 )).fetchone()
                 if row is None:
                     continue
@@ -718,11 +724,20 @@ class SqlAccountRepository:
                 if patch.quota_console is not None:
                     updates["quota_console"] = json.dumps(patch.quota_console)
                 if patch.usage_use_delta is not None:
-                    updates["usage_use_count"] = max(0, record.usage_use_count + patch.usage_use_delta)
+                    delta = int(patch.usage_use_delta)
+                    updates["usage_use_count"] = sa.text(
+                        f"GREATEST(0, usage_use_count + {delta})"
+                    )
                 if patch.usage_fail_delta is not None:
-                    updates["usage_fail_count"] = max(0, record.usage_fail_count + patch.usage_fail_delta)
+                    delta = int(patch.usage_fail_delta)
+                    updates["usage_fail_count"] = sa.text(
+                        f"GREATEST(0, usage_fail_count + {delta})"
+                    )
                 if patch.usage_sync_delta is not None:
-                    updates["usage_sync_count"] = max(0, record.usage_sync_count + patch.usage_sync_delta)
+                    delta = int(patch.usage_sync_delta)
+                    updates["usage_sync_count"] = sa.text(
+                        f"GREATEST(0, usage_sync_count + {delta})"
+                    )
 
                 tags = list(record.tags)
                 if patch.tags is not None:
@@ -741,7 +756,8 @@ class SqlAccountRepository:
                 if patch.clear_failures:
                     for k in ("cooldown_until", "cooldown_reason", "disabled_at",
                               "disabled_reason", "expired_at", "expired_reason",
-                              "forbidden_strikes"):
+                              "forbidden_strikes", "console_429_count",
+                              "console_429_last_at"):
                         ext.pop(k, None)
                     updates["status"]           = AccountStatus.ACTIVE.value
                     updates["usage_fail_count"] = 0

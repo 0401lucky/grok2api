@@ -55,6 +55,18 @@ _MODE_KEYS = {
     5: "quota_console",
 }
 
+_CONSOLE_429_EXPIRE_THRESHOLD = 3
+_CONSOLE_429_WINDOW_MS = 12 * 3600 * 1000
+_CONSOLE_429_RECOVER_AFTER_MS = 3600 * 1000
+_CONSOLE_429_REASON = "console_429_threshold_exceeded"
+
+
+def _safe_int(value: object, default: int = 0) -> int:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
 
 def _infer_pool_from_live_windows(windows: dict[int, QuotaWindow]) -> str | None:
     """只根据能代表账号权益的真实额度推断账号池。"""
@@ -184,7 +196,7 @@ class AccountRefreshService:
         if not active:
             return RefreshResult(checked=len(records))
 
-        concurrency = get_config("account.refresh.usage_concurrency", 50)
+        concurrency = get_config("account.refresh.usage_concurrency", 15)
         results = await run_batch(
             active,
             lambda r: self._refresh_one(r, apply_fallback=True, bootstrap=True),
@@ -244,7 +256,7 @@ class AccountRefreshService:
         if pool is not None:
             records = [r for r in records if r.pool == pool]
 
-        concurrency = get_config("account.refresh.usage_concurrency", 50)
+        concurrency = get_config("account.refresh.usage_concurrency", 15)
         results = await run_batch(
             records,
             lambda r: self._refresh_one(r, apply_fallback=True),
@@ -278,7 +290,7 @@ class AccountRefreshService:
     async def refresh_tokens(self, tokens: list[str]) -> RefreshResult:
         """Explicit refresh for a list of tokens (admin / manual trigger)."""
         records = [r for r in await self._repo.get_accounts(tokens) if is_manageable(r)]
-        concurrency = get_config("account.refresh.usage_concurrency", 50)
+        concurrency = get_config("account.refresh.usage_concurrency", 15)
         verify_session = get_config().get_bool(
             "account.refresh.manual_verify_session", True
         )
@@ -487,23 +499,70 @@ class AccountRefreshService:
                 ):
                     now = now_ms()
                     quota_patch: dict[str, dict] = {}
+                    extra_patch: dict[str, object] = {}
                     window = normalize_quota_set(
                         record.pool, record.quota_set()
                     ).get(mode_id)
                     if window is not None:
-                        reset_at = (
-                            window.reset_at
-                            if window.reset_at is not None and window.reset_at > now
-                            else now + max(window.window_seconds, 1) * 1000
-                        )
-                        quota_patch[_MODE_KEYS[mode_id]] = QuotaWindow(
-                            remaining=0,
-                            total=window.total,
-                            window_seconds=window.window_seconds,
-                            reset_at=reset_at,
-                            synced_at=window.synced_at,
-                            source=QuotaSource.ESTIMATED,
-                        ).to_dict()
+                        if mode_id == 5:
+                            # Console 429 只清空当前本地窗口，并用独立计数器判断是否隔离。
+                            reset_at = (
+                                window.reset_at
+                                if window.reset_at is not None and window.reset_at > now
+                                else now + max(window.window_seconds, 1) * 1000
+                            )
+                            quota_patch[_MODE_KEYS[mode_id]] = QuotaWindow(
+                                remaining=0,
+                                total=window.total,
+                                window_seconds=window.window_seconds,
+                                reset_at=reset_at,
+                                synced_at=window.synced_at,
+                                source=QuotaSource.ESTIMATED,
+                            ).to_dict()
+
+                            ext_data = record.ext or {}
+                            last_429_at = _safe_int(
+                                ext_data.get("console_429_last_at")
+                            )
+                            if (
+                                last_429_at > 0
+                                and now - last_429_at > _CONSOLE_429_WINDOW_MS
+                            ):
+                                current_count = 0
+                            else:
+                                current_count = _safe_int(
+                                    ext_data.get("console_429_count")
+                                )
+                            new_count = current_count + 1
+                            ext_merge: dict[str, object] = {
+                                "console_429_count": new_count,
+                                "console_429_last_at": now,
+                            }
+                            if new_count >= _CONSOLE_429_EXPIRE_THRESHOLD:
+                                extra_patch["status"] = AccountStatus.EXPIRED
+                                extra_patch["state_reason"] = _CONSOLE_429_REASON
+                                ext_merge["expired_at"] = now
+                                ext_merge["expired_reason"] = _CONSOLE_429_REASON
+                                logger.info(
+                                    "account marked expired due to repeated console 429: token={}... count={}",
+                                    token[:10],
+                                    new_count,
+                                )
+                            extra_patch["ext_merge"] = ext_merge
+                        else:
+                            reset_at = (
+                                window.reset_at
+                                if window.reset_at is not None and window.reset_at > now
+                                else now + max(window.window_seconds, 1) * 1000
+                            )
+                            quota_patch[_MODE_KEYS[mode_id]] = QuotaWindow(
+                                remaining=0,
+                                total=window.total,
+                                window_seconds=window.window_seconds,
+                                reset_at=reset_at,
+                                synced_at=window.synced_at,
+                                source=QuotaSource.ESTIMATED,
+                            ).to_dict()
                     await self._repo.patch_accounts(
                         [
                             AccountPatch(
@@ -511,6 +570,7 @@ class AccountRefreshService:
                                 usage_fail_delta=1,
                                 last_fail_at=now,
                                 last_fail_reason="rate_limited",
+                                **extra_patch,
                                 **quota_patch,
                             )
                         ]
@@ -663,9 +723,13 @@ class AccountRefreshService:
             console_win = record.quota_set().console
             if console_win is None:
                 continue
-            if not console_win.is_window_expired(now):
+            window_expired = console_win.is_window_expired(now)
+            stuck_without_reset = (
+                console_win.remaining <= 0 and console_win.reset_at is None
+            )
+            if not window_expired and not stuck_without_reset:
                 continue
-            if console_win.remaining >= console_win.total:
+            if console_win.remaining >= console_win.total and console_win.reset_at is None:
                 continue
 
             default = default_quota_window(record.pool, 5)
@@ -690,6 +754,36 @@ class AccountRefreshService:
 
         result = await self._repo.patch_accounts(patches)
         logger.debug("console quota windows auto-reset: count={}", result.patched)
+        return result.patched
+
+    async def recover_console_expired_accounts(self) -> int:
+        """自动恢复被 console 429 误判隔离且有成功历史的账号。"""
+        from .commands import AccountPatch
+
+        now = now_ms()
+        recovery_threshold = now - _CONSOLE_429_RECOVER_AFTER_MS
+        snapshot = await self._repo.runtime_snapshot()
+        patches: list[AccountPatch] = []
+
+        for record in snapshot.items:
+            if record.is_deleted():
+                continue
+            if record.status != AccountStatus.EXPIRED:
+                continue
+            if record.state_reason != _CONSOLE_429_REASON:
+                continue
+            if record.usage_use_count <= 5:
+                continue
+            expired_at = _safe_int((record.ext or {}).get("expired_at"))
+            if expired_at <= 0 or expired_at > recovery_threshold:
+                continue
+            patches.append(AccountPatch(token=record.token, clear_failures=True))
+
+        if not patches:
+            return 0
+
+        result = await self._repo.patch_accounts(patches)
+        logger.info("console 429 expired accounts auto-recovered: count={}", result.patched)
         return result.patched
 
 
