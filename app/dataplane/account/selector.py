@@ -147,10 +147,13 @@ def _quota_select(
     working: set[int] = candidates.copy()
     if exclude_idxs:
         working -= exclude_idxs
+    max_inflight = int(
+        get_config("account.selection.max_inflight", _QUOTA_MAX_INFLIGHT)
+    )
     working = {
         idx for idx in working
         if int(quota_col[idx]) > 0
-        and int(inflight_col[idx]) < _QUOTA_MAX_INFLIGHT
+        and int(inflight_col[idx]) < max_inflight
     }
     if not working:
         return None
